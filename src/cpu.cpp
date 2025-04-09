@@ -1,207 +1,214 @@
 #include "cpu.h"
-#include <cstdint>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-// Condition codes
-enum Condition {
-    EQ = 0, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE, AL, NV
-};
-
-// Operating modes
-enum Mode {
-    USER = 0x10, FIQ = 0x11, IRQ = 0x12, SVC = 0x13
-};
-
-// PSR bit masks (26-bit mode, ARM3-compatible)
-#define N_FLAG (1 << 31)
-#define Z_FLAG (1 << 30)
-#define C_FLAG (1 << 29)
-#define V_FLAG (1 << 28)
-#define I_FLAG (1 << 27) // IRQ disable
-#define F_FLAG (1 << 26) // FIQ disable
-#define MODE_MASK 0x1F
+#define ROM_BASE 0x03800000 // Updated to match branch target
+#define ADDR_MASK 0x03FFFFFF // 26-bit address space for ARMv3 (Acorn Archimedes)
 
 arm3_cpu_t* cpu_create(memory_t* mem) {
     arm3_cpu_t* cpu = (arm3_cpu_t*)malloc(sizeof(arm3_cpu_t));
-    if (!cpu) return nullptr;
+    if (!cpu) {
+        printf("Failed to allocate CPU\n");
+        return NULL; // Changed from nullptr to NULL for C compatibility
+    }
+    
     cpu->memory = mem;
+    for (int i = 0; i < 16; i++) {
+        cpu->registers[i] = 0;
+    }
+    cpu->cpsr = PSR_I | PSR_F | MODE_SVC; // Supervisor mode, interrupts off
+    cpu->spsr = 0;
     cpu_reset(cpu);
+    
     return cpu;
 }
 
 void cpu_destroy(arm3_cpu_t* cpu) {
-    if (cpu) free(cpu);
+    if (cpu) {
+        free(cpu);
+    }
 }
 
 void cpu_reset(arm3_cpu_t* cpu) {
-    for (int i = 0; i < 15; i++) cpu->registers[i] = 0;
-    cpu->registers[15] = 0x03400000; // Start at ROM base (ARM3 reset vector)
-    cpu->psr = I_FLAG | (SVC & MODE_MASK); // IRQs disabled, SVC mode
+    for (int i = 0; i < 16; i++) {
+        cpu->registers[i] = 0;
+    }
+    cpu->registers[15] = 0x00000000; // Start at reset vector
+    cpu->cpsr = PSR_I | PSR_F | MODE_SVC;
+    cpu->spsr = 0;
+    printf("CPU reset: PC = 0x%08X\n", cpu->registers[15]);
 }
 
-uint32_t cpu_get_register(arm3_cpu_t* cpu, int reg) {
-    return cpu->registers[reg];
+static void update_flags(arm3_cpu_t* cpu, uint32_t result, uint32_t op1, uint32_t op2, int carry, int overflow) {
+    cpu->cpsr &= ~(PSR_N | PSR_Z | PSR_C | PSR_V);
+    if (result & 0x80000000) cpu->cpsr |= PSR_N;
+    if (result == 0) cpu->cpsr |= PSR_Z;
+    if (carry) cpu->cpsr |= PSR_C;
+    if (overflow) cpu->cpsr |= PSR_V;
 }
 
-static bool check_condition(arm3_cpu_t* cpu, uint32_t cond) {
-    bool n = cpu->psr & N_FLAG;
-    bool z = cpu->psr & Z_FLAG;
-    bool c = cpu->psr & C_FLAG;
-    bool v = cpu->psr & V_FLAG;
+static int condition_met(arm3_cpu_t* cpu, uint32_t cond) {
     switch (cond) {
-        case EQ: return z;
-        case NE: return !z;
-        case CS: return c;
-        case CC: return !c;
-        case MI: return n;
-        case PL: return !n;
-        case VS: return v;
-        case VC: return !v;
-        case HI: return c && !z;
-        case LS: return !c || z;
-        case GE: return n == v;
-        case LT: return n != v;
-        case GT: return !z && (n == v);
-        case LE: return z || (n != v);
-        case AL: return true;
-        case NV: return false;
-        default: return false;
+        case 0x0: return (cpu->cpsr & PSR_Z) != 0;                      // EQ
+        case 0x1: return (cpu->cpsr & PSR_Z) == 0;                      // NE
+        case 0x2: return (cpu->cpsr & PSR_C) != 0;                      // CS/HS
+        case 0x3: return (cpu->cpsr & PSR_C) == 0;                      // CC/LO
+        case 0x4: return (cpu->cpsr & PSR_N) != 0;                      // MI
+        case 0x5: return (cpu->cpsr & PSR_N) == 0;                      // PL
+        case 0x6: return (cpu->cpsr & PSR_V) != 0;                      // VS
+        case 0x7: return (cpu->cpsr & PSR_V) == 0;                      // VC
+        case 0x8: return (cpu->cpsr & PSR_C) != 0 && (cpu->cpsr & PSR_Z) == 0; // HI
+        case 0x9: return (cpu->cpsr & PSR_C) == 0 || (cpu->cpsr & PSR_Z) != 0; // LS
+        case 0xA: return ((cpu->cpsr & PSR_N) >> 31) == ((cpu->cpsr & PSR_V) >> 28); // GE
+        case 0xB: return ((cpu->cpsr & PSR_N) >> 31) != ((cpu->cpsr & PSR_V) >> 28); // LT
+        case 0xC: return (cpu->cpsr & PSR_Z) == 0 && ((cpu->cpsr & PSR_N) >> 31) == ((cpu->cpsr & PSR_V) >> 28); // GT
+        case 0xD: return (cpu->cpsr & PSR_Z) != 0 || ((cpu->cpsr & PSR_N) >> 31) != ((cpu->cpsr & PSR_V) >> 28); // LE
+        case 0xE: return 1;                                             // AL
+        case 0xF: return 0;                                             // NV (reserved)
+        default: return 0;
     }
 }
 
-static void update_flags(arm3_cpu_t* cpu, uint32_t result, bool carry, bool overflow) {
-    cpu->psr = (cpu->psr & ~(N_FLAG | Z_FLAG | C_FLAG | V_FLAG)) |
-               (result & 0x80000000 ? N_FLAG : 0) |
-               (result == 0 ? Z_FLAG : 0) |
-               (carry ? C_FLAG : 0) |
-               (overflow ? V_FLAG : 0);
-}
-
-static uint32_t get_operand2(arm3_cpu_t* cpu, uint32_t instr, bool* carry_out) {
-    bool i_bit = (instr >> 25) & 1;
-    uint32_t operand2 = instr & 0xFFF;
-    uint32_t rm = instr & 0xF;
-    if (i_bit) { // Immediate
-        uint32_t imm = operand2 & 0xFF;
-        uint32_t rotate = (operand2 >> 8) & 0xF;
-        uint32_t result = (imm >> (2 * rotate)) | (imm << (32 - 2 * rotate));
-        *carry_out = cpu->psr & C_FLAG; // Carry unchanged for immediate
-        return result;
+static uint32_t get_operand2(arm3_cpu_t* cpu, uint32_t instr, int* carry_out) {
+    uint32_t operand2;
+    if (instr & (1 << 25)) { // Immediate
+        uint32_t imm = instr & 0xFF;
+        uint32_t rot = (instr >> 8) & 0xF;
+        operand2 = (imm >> (2 * rot)) | (imm << (32 - 2 * rot));
+        *carry_out = (rot == 0) ? (cpu->cpsr & PSR_C) : ((operand2 >> 31) & 1);
     } else { // Register
-        bool shift_by_reg = (instr >> 4) & 1;
-        uint32_t shift = (instr >> 7) & 0x1F;
-        uint32_t shift_type = (instr >> 5) & 3;
-        uint32_t value = cpu->registers[rm];
-        if (shift_by_reg) {
+        uint32_t rm = instr & 0xF;
+        operand2 = cpu->registers[rm];
+        uint32_t shift = (instr >> 4) & 0xFF;
+        if (shift & 0x1) { // Register shift
             uint32_t rs = (instr >> 8) & 0xF;
-            shift = cpu->registers[rs] & 0xFF;
-        }
-        switch (shift_type) {
-            case 0: // LSL
-                if (shift == 0) return value;
-                *carry_out = (value >> (32 - shift)) & 1;
-                return value << shift;
-            case 1: // LSR
-                if (shift == 0) shift = 32;
-                *carry_out = (value >> (shift - 1)) & 1;
-                return value >> shift;
-            case 2: // ASR
-                if (shift == 0) shift = 32;
-                *carry_out = (value >> (shift - 1)) & 1;
-                return (int32_t)value >> shift;
-            case 3: // ROR
-                if (shift == 0) { // RRX
-                    *carry_out = value & 1;
-                    return (value >> 1) | ((cpu->psr & C_FLAG) ? 0x80000000 : 0);
-                }
-                *carry_out = (value >> (shift - 1)) & 1;
-                return (value >> shift) | (value << (32 - shift));
+            uint32_t shift_amount = cpu->registers[rs] & 0xFF;
+            switch ((shift >> 1) & 0x3) {
+                case 0: // LSL
+                    if (shift_amount > 32) { operand2 = 0; *carry_out = 0; }
+                    else if (shift_amount == 32) { *carry_out = operand2 & 1; operand2 = 0; }
+                    else if (shift_amount > 0) { *carry_out = (operand2 >> (32 - shift_amount)) & 1; operand2 <<= shift_amount; }
+                    break;
+                case 1: // LSR
+                    if (shift_amount > 32) { operand2 = 0; *carry_out = 0; }
+                    else if (shift_amount == 32) { *carry_out = (operand2 >> 31) & 1; operand2 = 0; }
+                    else if (shift_amount > 0) { *carry_out = (operand2 >> (shift_amount - 1)) & 1; operand2 >>= shift_amount; }
+                    break;
+                case 2: // ASR
+                    if (shift_amount >= 32) { *carry_out = (operand2 >> 31) & 1; operand2 = (int32_t)operand2 >> 31; }
+                    else { *carry_out = (operand2 >> (shift_amount - 1)) & 1; operand2 = (int32_t)operand2 >> shift_amount; }
+                    break;
+                case 3: // ROR
+                    if (shift_amount == 0) break; // RRX not implemented yet
+                    shift_amount &= 31;
+                    if (shift_amount > 0) { *carry_out = (operand2 >> (shift_amount - 1)) & 1; operand2 = (operand2 >> shift_amount) | (operand2 << (32 - shift_amount)); }
+                    break;
+            }
+        } else { // Immediate shift
+            uint32_t shift_amount = (shift >> 3) & 0x1F;
+            switch ((shift >> 1) & 0x3) {
+                case 0: // LSL
+                    if (shift_amount > 0) { *carry_out = (operand2 >> (32 - shift_amount)) & 1; operand2 <<= shift_amount; }
+                    break;
+                case 1: // LSR
+                    if (shift_amount == 0) { operand2 = 0; *carry_out = (operand2 >> 31) & 1; }
+                    else { *carry_out = (operand2 >> (shift_amount - 1)) & 1; operand2 >>= shift_amount; }
+                    break;
+                case 2: // ASR
+                    if (shift_amount == 0) { *carry_out = (operand2 >> 31) & 1; operand2 = (int32_t)operand2 >> 31; }
+                    else { *carry_out = (operand2 >> (shift_amount - 1)) & 1; operand2 = (int32_t)operand2 >> shift_amount; }
+                    break;
+                case 3: // ROR
+                    if (shift_amount == 0) break; // RRX not implemented yet
+                    *carry_out = (operand2 >> (shift_amount - 1)) & 1;
+                    operand2 = (operand2 >> shift_amount) | (operand2 << (32 - shift_amount));
+                    break;
+            }
         }
     }
-    return 0;
-}
-
-static void switch_mode(arm3_cpu_t* cpu, uint32_t new_mode) {
-    cpu->psr = (cpu->psr & ~MODE_MASK) | (new_mode & MODE_MASK);
+    return operand2;
 }
 
 void cpu_step(arm3_cpu_t* cpu) {
-    uint32_t pc = cpu->registers[15] & 0x03FFFFFC;
-    if (pc < RAM_BASE || (pc >= RAM_BASE + RAM_SIZE && pc < IO_BASE) ||
-        (pc >= IO_BASE + IO_SIZE && pc < ROM_BASE) || pc >= ROM_BASE + ROM_SIZE) {
-        printf("PC out of bounds: 0x%08X, halting\n", pc);
-        cpu->registers[15] = pc; // Freeze PC for debugging
+    uint32_t fetch_pc = cpu->registers[15] & ADDR_MASK; // Fetch stage PC
+    uint32_t instr = memory_read_word(cpu->memory, fetch_pc);
+    if (instr == 0xFFFFFFFF) { // Assuming memory_read_word returns -1 on invalid read
+        printf("Invalid read at 0x%08X\n", fetch_pc);
+        return;
+    }
+    printf("PC: 0x%08X, Instr: 0x%08X\n", fetch_pc, instr);
+    cpu->registers[15] += 4; // Advance PC for next fetch (pipeline: fetch, decode, execute)
+
+    uint32_t cond = (instr >> 28) & 0xF;
+    if (!condition_met(cpu, cond)) {
         return;
     }
 
-    uint32_t instr = memory_read_word(cpu->memory, pc);
-    cpu->registers[15] = (cpu->registers[15] & ~0x03FFFFFC) | ((pc + 4) & 0x03FFFFFC); // Increment PC
-
-    uint32_t cond = (instr >> 28) & 0xF;
-    if (!check_condition(cpu, cond)) return;
-
-    uint32_t opcode = (instr >> 21) & 0xF;
-    uint32_t i_bit = (instr >> 25) & 1;
-    uint32_t s_bit = (instr >> 20) & 1;
-    uint32_t rn = (instr >> 16) & 0xF;
-    uint32_t rd = (instr >> 12) & 0xF;
-    uint32_t rm = instr & 0xF;
-
-    if ((instr & 0x0C000000) == 0x00000000) { // Data Processing
-        bool carry = cpu->psr & C_FLAG;
-        bool overflow = false;
+    // Data Processing
+    if ((instr & 0x0C000000) == 0x00000000) {
+        uint32_t opcode = (instr >> 21) & 0xF;
+        uint32_t rn = (instr >> 16) & 0xF;
+        uint32_t rd = (instr >> 12) & 0xF;
+        int s_flag = (instr >> 20) & 1;
+        int carry_in = (cpu->cpsr & PSR_C) ? 1 : 0;
+        int carry_out = carry_in;
         uint32_t op1 = cpu->registers[rn];
-        uint32_t op2 = get_operand2(cpu, instr, &carry);
-        uint32_t result = 0;
-        bool write_result = true;
+        uint32_t op2 = get_operand2(cpu, instr, &carry_out);
+        uint32_t result;
+        int overflow = 0;
 
         switch (opcode) {
             case 0x0: result = op1 & op2; break; // AND
             case 0x1: result = op1 ^ op2; break; // EOR
             case 0x2: // SUB
                 result = op1 - op2;
-                carry = op1 >= op2;
-                overflow = ((op1 ^ result) & (op1 ^ op2)) >> 31;
+                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
+                carry_out = (op1 >= op2);
                 break;
             case 0x3: // RSB
                 result = op2 - op1;
-                carry = op2 >= op1;
-                overflow = ((op2 ^ result) & (op2 ^ op1)) >> 31;
+                overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31;
+                carry_out = (op2 >= op1);
                 break;
             case 0x4: // ADD
                 result = op1 + op2;
-                carry = result < op1;
                 overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
+                carry_out = (result < op1);
                 break;
             case 0x5: // ADC
-                result = op1 + op2 + (cpu->psr & C_FLAG ? 1 : 0);
-                carry = result < op1 || (result == op1 && (cpu->psr & C_FLAG));
+                result = op1 + op2 + carry_in;
                 overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
+                carry_out = (result < op1) || (result == op1 && op2 != 0);
                 break;
             case 0x6: // SBC
-                result = op1 - op2 - (cpu->psr & C_FLAG ? 0 : 1);
-                carry = op1 >= op2 && (op1 > op2 || (cpu->psr & C_FLAG));
-                overflow = ((op1 ^ result) & (op1 ^ op2)) >> 31;
+                result = op1 - op2 + carry_in - 1;
+                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
+                carry_out = (op1 >= op2) || (op1 == op2 && carry_in);
                 break;
             case 0x7: // RSC
-                result = op2 - op1 - (cpu->psr & C_FLAG ? 0 : 1);
-                carry = op2 >= op1 && (op2 > op1 || (cpu->psr & C_FLAG));
-                overflow = ((op2 ^ result) & (op2 ^ op1)) >> 31;
+                result = op2 - op1 + carry_in - 1;
+                overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31;
+                carry_out = (op2 >= op1) || (op2 == op1 && carry_in);
                 break;
-            case 0x8: result = op1 & op2; write_result = false; break; // TST
-            case 0x9: result = op1 ^ op2; write_result = false; break; // TEQ
+            case 0x8: // TST
+                result = op1 & op2;
+                if (rd != 0) printf("Invalid TST with Rd != 0 at 0x%08X\n", fetch_pc);
+                break;
+            case 0x9: // TEQ
+                result = op1 ^ op2;
+                if (rd != 0) printf("Invalid TEQ with Rd != 0 at 0x%08X\n", fetch_pc);
+                break;
             case 0xA: // CMP
                 result = op1 - op2;
-                carry = op1 >= op2;
-                overflow = ((op1 ^ result) & (op1 ^ op2)) >> 31;
-                write_result = false;
+                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
+                carry_out = (op1 >= op2);
+                if (rd != 0) printf("Invalid CMP with Rd != 0 at 0x%08X\n", fetch_pc);
                 break;
             case 0xB: // CMN
                 result = op1 + op2;
-                carry = result < op1;
                 overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
-                write_result = false;
+                carry_out = (result < op1);
+                if (rd != 0) printf("Invalid CMN with Rd != 0 at 0x%08X\n", fetch_pc);
                 break;
             case 0xC: result = op1 | op2; break; // ORR
             case 0xD: result = op2; break; // MOV
@@ -209,139 +216,124 @@ void cpu_step(arm3_cpu_t* cpu) {
             case 0xF: result = ~op2; break; // MVN
         }
 
-        if (write_result && rd != 15) {
-            cpu->registers[rd] = result;
+        if (s_flag || opcode >= 0x8) {
+            update_flags(cpu, result, op1, op2, carry_out, overflow);
         }
-        if (s_bit || !write_result) {
-            update_flags(cpu, result, carry, overflow);
-        }
-        if (write_result && rd == 15) {
-            cpu->registers[15] = (result & 0x03FFFFFF) | (cpu->psr & 0xFC000000);
-            printf("PC written: 0x%08X from instr 0x%08X at 0x%08X\n", cpu->registers[15], instr, pc);
+        if (opcode < 0x8 || opcode >= 0xC) {
+            if (rd != 15) cpu->registers[rd] = result;
+            else cpu->registers[15] = result & ADDR_MASK;
         }
     }
-    else if ((instr & 0x0F8000F0) == 0x00000090) { // Multiply (MUL, MLA) - ARM3 hardware multiplier
-        uint32_t rs = (instr >> 8) & 0xF;
-        uint32_t rm = instr & 0xF;
-        uint32_t ra = (instr >> 16) & 0xF;
-        bool accumulate = (instr >> 21) & 1;
-        uint32_t result = cpu->registers[rm] * cpu->registers[rs];
-        if (accumulate) result += cpu->registers[ra];
-        cpu->registers[rd] = result;
-        if (s_bit) {
-            cpu->psr = (cpu->psr & ~(N_FLAG | Z_FLAG)) |
-                       (result & 0x80000000 ? N_FLAG : 0) |
-                       (result == 0 ? Z_FLAG : 0);
+    // Branch (corrected mask and pipeline handling)
+    else if ((instr & 0x0F000000) == 0x0A000000) { // B or BL
+        int32_t offset = instr & 0x00FFFFFF; // Extract 24-bit offset
+        if (offset & 0x00800000) offset |= 0xFF000000; // Sign-extend
+        offset <<= 2; // Multiply by 4 for byte addressing
+        uint32_t base_pc = fetch_pc + 8; // ARMv3 pipeline: PC + 8 at execution
+        uint32_t new_pc = base_pc + offset;
+        if (instr & (1 << 24)) { // Link (BL)
+            cpu->registers[14] = cpu->registers[15]; // Save next instruction address
         }
+        cpu->registers[15] = new_pc & ADDR_MASK;
+        printf("Branch to: 0x%08X from instr 0x%08X at 0x%08X (offset: 0x%08X)\n", 
+               new_pc & ADDR_MASK, instr, fetch_pc, offset);
     }
-    else if ((instr & 0x0C000000) == 0x04000000) { // Single Data Transfer
-        bool load = (instr >> 20) & 1;
-        bool byte = (instr >> 22) & 1;
-        bool writeback = (instr >> 21) & 1;
-        bool pre = (instr >> 24) & 1;
-        bool up = (instr >> 23) & 1;
-        uint32_t offset = i_bit ? (instr & 0xFFF) : cpu->registers[rm];
-        uint32_t addr = cpu->registers[rn];
+    // Load/Store (Fixed post-indexed addressing)
+    else if ((instr & 0x0C000000) == 0x04000000) {
+        uint32_t rn = (instr >> 16) & 0xF;
+        uint32_t rd = (instr >> 12) & 0xF;
+        int load = (instr >> 20) & 1;
+        int byte = (instr >> 22) & 1;
+        int up = (instr >> 23) & 1;
+        int pre = (instr >> 24) & 1;
+        int writeback = (instr >> 21) & 1;
+        uint32_t base = cpu->registers[rn];
+        uint32_t offset;
+
+        if (instr & (1 << 25)) {
+            int carry_out;
+            offset = get_operand2(cpu, instr, &carry_out);
+        } else {
+            offset = instr & 0xFFF;
+        }
+
+        uint32_t addr = up ? base + offset : base - offset;
         if (pre) {
-            addr = up ? addr + offset : addr - offset;
-        }
-        if (load) {
-            if (byte) {
-                cpu->registers[rd] = memory_read_byte(cpu->memory, addr);
+            // Pre-indexed: Compute address first, then load/store
+            if (load) {
+                if (byte) cpu->registers[rd] = memory_read_byte(cpu->memory, addr);
+                else cpu->registers[rd] = memory_read_word(cpu->memory, addr);
             } else {
-                cpu->registers[rd] = memory_read_word(cpu->memory, addr);
+                if (byte) memory_write_byte(cpu->memory, addr, cpu->registers[rd]);
+                else memory_write_word(cpu->memory, addr, cpu->registers[rd]);
             }
+            if (writeback) cpu->registers[rn] = addr; // Write back the computed address
         } else {
-            if (byte) {
-                memory_write_byte(cpu->memory, addr, cpu->registers[rd] & 0xFF);
+            // Post-indexed: Load/store using base, then update base
+            if (load) {
+                if (byte) cpu->registers[rd] = memory_read_byte(cpu->memory, base);
+                else cpu->registers[rd] = memory_read_word(cpu->memory, base);
             } else {
-                memory_write_word(cpu->memory, addr, cpu->registers[rd]);
+                if (byte) memory_write_byte(cpu->memory, base, cpu->registers[rd]);
+                else memory_write_word(cpu->memory, addr, cpu->registers[rd]);
             }
+            cpu->registers[rn] = addr; // Update base register with new address
         }
-        if (!pre) {
-            addr = up ? addr + offset : addr - offset;
-        }
-        if (writeback || !pre) {
-            cpu->registers[rn] = addr;
-        }
-        if (rd == 15 && load) {
-            cpu->registers[15] = (cpu->registers[15] & 0x03FFFFFF) | (cpu->psr & 0xFC000000);
-            printf("PC loaded: 0x%08X from addr 0x%08X, instr 0x%08X at 0x%08X\n", cpu->registers[15], addr, instr, pc);
-        }
+        if (rd == 15) cpu->registers[15] &= ADDR_MASK;
     }
-    else if ((instr & 0x0E000000) == 0x08000000) { // Branch
-        bool link = (instr >> 24) & 1;
-        int32_t offset = (instr & 0x00FFFFFF) << 2;
-        if (offset & 0x02000000) offset |= 0xFC000000; // Sign-extend
-        if (link) {
-            cpu->registers[14] = cpu->registers[15] - 4;
-        }
-        uint32_t new_pc = (cpu->registers[15] + offset) & 0x03FFFFFF;
-        cpu->registers[15] = (cpu->registers[15] & 0xFC000000) | new_pc;
-        printf("Branch to: 0x%08X from instr 0x%08X at 0x%08X\n", new_pc, instr, pc);
-    }
-    else if ((instr & 0x0E000000) == 0x0A000000) { // Block Data Transfer
-        bool load = (instr >> 20) & 1;
-        bool pre = (instr >> 24) & 1;
-        bool up = (instr >> 23) & 1;
-        bool psr = (instr >> 22) & 1;
-        bool writeback = (instr >> 21) & 1;
+    // Multiple Load/Store
+    else if ((instr & 0x0E000000) == 0x08000000) {
+        uint32_t rn = (instr >> 16) & 0xF;
+        int load = (instr >> 20) & 1;
+        int up = (instr >> 23) & 1;
+        int pre = (instr >> 24) & 1;
+        int writeback = (instr >> 21) & 1;
         uint32_t reg_list = instr & 0xFFFF;
-        uint32_t addr = cpu->registers[rn];
-        uint32_t old_psr = cpu->psr;
-
-        if (psr && load) {
-            switch_mode(cpu, USER);
-        }
-
+        uint32_t base = cpu->registers[rn];
         int count = 0;
-        for (int i = 0; i < 16; i++) {
-            if (reg_list & (1 << i)) count++;
-        }
-        uint32_t start_addr = addr;
-        if (up) {
-            if (pre) addr += 4;
-        } else {
-            addr -= count * 4;
-            if (pre) addr += 4;
-        }
+        for (int i = 0; i < 16; i++) if (reg_list & (1 << i)) count++;
+
+        uint32_t addr = up ? base : base - (count * 4);
+        if (!up && !pre) addr += 4;
+        if (up && pre) addr += 4;
 
         for (int i = 0; i < 16; i++) {
             if (reg_list & (1 << i)) {
-                if (load) {
-                    cpu->registers[i] = memory_read_word(cpu->memory, addr);
-                } else {
-                    memory_write_word(cpu->memory, addr, cpu->registers[i]);
-                }
+                if (load) cpu->registers[i] = memory_read_word(cpu->memory, addr);
+                else memory_write_word(cpu->memory, addr, cpu->registers[i]);
                 addr += 4;
             }
         }
+        if (writeback) cpu->registers[rn] = up ? base + (count * 4) : base - (count * 4);
+        if (load && (reg_list & (1 << 15))) cpu->registers[15] &= ADDR_MASK;
+    }
+    // Multiply
+    else if ((instr & 0x0FC000F0) == 0x00000090) {
+        uint32_t rd = (instr >> 16) & 0xF;
+        uint32_t rn = (instr >> 12) & 0xF;
+        uint32_t rs = (instr >> 8) & 0xF;
+        uint32_t rm = instr & 0xF;
+        int accumulate = (instr >> 21) & 1;
+        int set_flags = (instr >> 20) & 1;
 
-        if (writeback) {
-            cpu->registers[rn] = up ? start_addr + count * 4 : start_addr - count * 4;
-        }
-        if (load && (reg_list & (1 << 15))) {
-            cpu->registers[15] = (cpu->registers[15] & 0x03FFFFFF) | (cpu->psr & 0xFC000000);
-            if (psr) {
-                cpu->psr = memory_read_word(cpu->memory, addr - 4);
-            }
-            printf("PC loaded from block: 0x%08X, instr 0x%08X at 0x%08X\n", cpu->registers[15], instr, pc);
-        }
-        if (psr && load) {
-            switch_mode(cpu, old_psr & MODE_MASK);
+        uint32_t result = cpu->registers[rm] * cpu->registers[rs];
+        if (accumulate) result += cpu->registers[rn];
+        cpu->registers[rd] = result;
+
+        if (set_flags) {
+            update_flags(cpu, result, 0, 0, 0, 0); // Only N and Z flags affected
         }
     }
-    else if ((instr & 0x0F000000) == 0x0F000000) { // Software Interrupt
-        cpu->registers[14] = cpu->registers[15] - 4;
-        cpu->psr |= I_FLAG;
-        switch_mode(cpu, SVC);
-        cpu->registers[15] = 0x00000008 | (cpu->psr & 0xFC000000);
-        printf("SWI: PC set to 0x%08X, instr 0x%08X at 0x%08X\n", cpu->registers[15], instr, pc);
+    // Software Interrupt
+    else if ((instr & 0x0F000000) == 0x0F000000) {
+        cpu->spsr = cpu->cpsr;
+        cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_SVC | PSR_I;
+        cpu->registers[14] = cpu->registers[15]; // Save next instruction address
+        cpu->registers[15] = 0x00000008 & ADDR_MASK; // SWI vector
+        printf("SWI at 0x%08X, comment: 0x%06X\n", fetch_pc, instr & 0xFFFFFF);
     }
-    else if ((instr & 0x0E000000) == 0x0C000000) { // Coprocessor Data Operations
-        printf("Coprocessor instruction 0x%08X at PC=0x%08X (unimplemented)\n", instr, pc);
-    }
+    // Unimplemented
     else {
-        printf("Unsupported instruction: 0x%08X at PC=0x%08X\n", instr, pc);
+        printf("Unimplemented instruction 0x%08X at 0x%08X\n", instr, fetch_pc);
     }
 }

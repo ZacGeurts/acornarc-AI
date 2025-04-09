@@ -9,12 +9,14 @@
 #include <zlib.h>
 #include "cpu.h"    
 #include "memory.h" 
+#include "io.h"
 
 uint8_t* floppy_data = nullptr; 
 size_t floppy_size = 0;         
 
 static arm3_cpu_t* cpu = nullptr;
 static memory_t* memory = nullptr;
+static io_t* io = nullptr;
 static bool running = false;
 static uint16_t* frame_buffer = nullptr;
 static const unsigned WIDTH = 320;
@@ -29,9 +31,6 @@ static bool pixel_format_set = false;
 
 static void handle_input(void);
 static void render_frame(void);
-static bool decompress_jfd(const char* jfd_path, uint8_t** out_data, size_t* out_size);
-static bool parse_jfd(uint8_t* data, size_t size, uint8_t** jfd_data, size_t* jfd_size);
-static bool load_adf(const char* adf_path, uint8_t** out_data, size_t* out_size);
 
 static void fallback_log(const char* fmt, ...) {
     va_list args;
@@ -70,6 +69,9 @@ static void log_message(enum retro_log_level level, const char* fmt, ...) {
     va_end(args);
 }
 
+// Use extern "C" to prevent name mangling for libretro API functions
+extern "C" {
+
 void retro_set_environment(retro_environment_t cb) {
     env_cb = cb;
     init_logging();
@@ -85,22 +87,36 @@ void retro_set_environment(retro_environment_t cb) {
             pixel_format_set = true;
         }
     }
+
+    // Tell RetroArch this core can run without content
+    bool no_content = true;
+    env_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_content);
 }
 
 void retro_init(void) {
     log_message(RETRO_LOG_INFO, "retro_init called\n");
 
+    io = io_create();
+    if (!io) {
+        log_message(RETRO_LOG_ERROR, "Failed to initialize I/O module\n");
+        send_message("Core failed to initialize I/O module");
+        running = false;
+        return;
+    }
+
     frame_buffer = (uint16_t*)malloc(WIDTH * HEIGHT * sizeof(uint16_t));
     if (!frame_buffer) {
         log_message(RETRO_LOG_ERROR, "Failed to allocate frame buffer\n");
         send_message("Core failed to allocate frame buffer");
+        io_destroy(io);
+        io = nullptr;
         running = false;
         return;
     }
 
     memset(frame_buffer, 0, WIDTH * HEIGHT * sizeof(uint16_t));
     for (unsigned i = 0; i < WIDTH * HEIGHT; i++) {
-        frame_buffer[i] = 0xF800; 
+        frame_buffer[i] = 0xF800; // Red screen for now
     }
 
     running = true;
@@ -108,197 +124,16 @@ void retro_init(void) {
     send_message("Acorn Archimedes Emulator initialized");
 }
 
-static bool decompress_jfd(const char* jfd_path, uint8_t** out_data, size_t* out_size) {
-    if (!jfd_path) {
-        log_message(RETRO_LOG_ERROR, "No .jfd path provided\n");
-        return false;
-    }
-    log_message(RETRO_LOG_INFO, "Decompressing JFD file: %s\n", jfd_path);
-
-    gzFile gz_file = gzopen(jfd_path, "rb");
-    if (!gz_file) {
-        log_message(RETRO_LOG_ERROR, "Failed to open gzip file: %s\n", jfd_path);
-        return false;
-    }
-
-    size_t buffer_size = ROM_SIZE;
-    *out_data = (uint8_t*)malloc(buffer_size);
-    if (!*out_data) {
-        log_message(RETRO_LOG_ERROR, "Failed to allocate decompression buffer\n");
-        gzclose(gz_file);
-        return false;
-    }
-
-    *out_size = 0;
-    const size_t chunk_size = 8192;
-    while (*out_size < buffer_size) {
-        int bytes_read = gzread(gz_file, *out_data + *out_size, chunk_size);
-        if (bytes_read <= 0) {
-            if (gzeof(gz_file)) break;
-            int err;
-            const char* err_str = gzerror(gz_file, &err);
-            log_message(RETRO_LOG_ERROR, "Decompression error %d: %s\n", err, err_str);
-            free(*out_data);
-            *out_data = nullptr;
-            *out_size = 0;
-            gzclose(gz_file);
-            return false;
-        }
-        *out_size += bytes_read;
-    }
-
-    if (*out_size >= buffer_size) {
-        log_message(RETRO_LOG_ERROR, "Decompressed data exceeds ROM_SIZE (%u bytes)\n", ROM_SIZE);
-        free(*out_data);
-        *out_data = nullptr;
-        *out_size = 0;
-        gzclose(gz_file);
-        return false;
-    }
-
-    gzclose(gz_file);
-    log_message(RETRO_LOG_INFO, "Decompressed %zu bytes\n", *out_size);
-    return true;
-}
-
-static bool parse_jfd(uint8_t* data, size_t size, uint8_t** jfd_data, size_t* jfd_size) {
-    if (size < 48) {
-        log_message(RETRO_LOG_ERROR, "Decompressed data too small for JFD header: %zu bytes\n", size);
-        return false;
-    }
-
-    log_message(RETRO_LOG_DEBUG, "JFD header first 4 bytes: %02x %02x %02x %02x\n",
-                data[0], data[1], data[2], data[3]);
-    if (memcmp(data, "JFDI", 4) != 0) {
-        log_message(RETRO_LOG_ERROR, "Invalid JFD identifier\n");
-        return false;
-    }
-
-    uint32_t file_size = data[8] | (data[9] << 8) | (data[10] << 16) | (data[11] << 24);
-    if (file_size > ROM_SIZE) {
-        log_message(RETRO_LOG_WARN, "JFD size %u exceeds ROM_SIZE %u, capping\n", file_size, ROM_SIZE);
-        file_size = ROM_SIZE;
-    }
-
-    uint32_t data_offset = data[32] | (data[33] << 8) | (data[34] << 16) | (data[35] << 24);
-    if (data_offset < 48 || data_offset >= size) {
-        log_message(RETRO_LOG_ERROR, "Invalid data table offset: %u\n", data_offset);
-        return false;
-    }
-
-    size_t remaining_size = size - data_offset;
-    if (remaining_size < file_size) {
-        log_message(RETRO_LOG_ERROR, "Not enough data for JFD: need %u, have %zu\n", file_size, remaining_size);
-        return false;
-    }
-
-    *jfd_data = (uint8_t*)malloc(file_size);
-    if (!*jfd_data) {
-        log_message(RETRO_LOG_ERROR, "Failed to allocate buffer for JFD data: %u bytes\n", file_size);
-        return false;
-    }
-
-    memcpy(*jfd_data, data + data_offset, file_size);
-    *jfd_size = file_size;
-    log_message(RETRO_LOG_INFO, "Parsed JFD data: %zu bytes from offset %u\n", *jfd_size, data_offset);
-    return true;
-}
-
-static bool load_adf(const char* adf_path, uint8_t** out_data, size_t* out_size) {
-    if (!adf_path) {
-        log_message(RETRO_LOG_ERROR, "No .adf path provided\n");
-        return false;
-    }
-    log_message(RETRO_LOG_INFO, "Loading ADF file: %s\n", adf_path);
-
-    FILE* file = fopen(adf_path, "rb");
-    if (!file) {
-        log_message(RETRO_LOG_ERROR, "Failed to open ADF file: %s\n", adf_path);
-        return false;
-    }
-
-    fseek(file, 0, SEEK_END);
-    size_t file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    if (file_size != 819200 && file_size != 1638400) {
-        log_message(RETRO_LOG_WARN, "Unexpected ADF size: %zu bytes (expected 819200 or 1638400)\n", file_size);
-    }
-
-    *out_data = (uint8_t*)malloc(file_size);
-    if (!*out_data) {
-        log_message(RETRO_LOG_ERROR, "Failed to allocate buffer for ADF data: %zu bytes\n", file_size);
-        fclose(file);
-        return false;
-    }
-
-    *out_size = fread(*out_data, 1, file_size, file);
-    if (*out_size != file_size) {
-        log_message(RETRO_LOG_ERROR, "Incomplete read: got %zu of %zu bytes\n", *out_size, file_size);
-        free(*out_data);
-        *out_data = nullptr;
-        fclose(file);
-        return false;
-    }
-
-    fclose(file);
-    log_message(RETRO_LOG_INFO, "Loaded ADF data: %zu bytes\n", *out_size);
-    return true;
-}
-
 bool retro_load_game(const struct retro_game_info* game) {
     log_message(RETRO_LOG_INFO, "retro_load_game called\n");
 
-    const char* file_path = nullptr;
-    if (!game || !game->path) {
-        log_message(RETRO_LOG_ERROR, "No game info or path provided\n");
-        send_message("No game file specified");
-        return false;
-    }
-    file_path = game->path;
-    log_message(RETRO_LOG_INFO, "Loading file from: %s\n", file_path);
-
-    const char* ext = strrchr(file_path, '.');
-    if (!ext) {
-        log_message(RETRO_LOG_ERROR, "No file extension found in path: %s\n", file_path);
-        send_message("Invalid file path: no extension");
-        return false;
-    }
-
-    bool is_jfd = (strcasecmp(ext, ".jfd") == 0);
-    bool is_adf = (strcasecmp(ext, ".adf") == 0);
-    if (!is_jfd && !is_adf) {
-        log_message(RETRO_LOG_ERROR, "Unsupported file extension: %s\n", ext);
-        send_message("Unsupported file type");
-        return false;
-    }
-
     const char* rom_path = "riscos.rom"; 
-    memory = memory_create(rom_path);
+    uint32_t rom_base = 0x03800000; // Updated to match new ROM_DEFAULT_BASE
+    memory = memory_create(rom_path, rom_base, io);
     if (!memory) {
-        log_message(RETRO_LOG_ERROR, "Failed to create memory system with ROM: %s\n", rom_path);
+        log_message(RETRO_LOG_ERROR, "Failed to create memory system with ROM: %s at 0x%08X\n", rom_path, rom_base);
         send_message("Failed to create memory system");
         return false;
-    }
-
-    if (is_adf) {
-        if (!load_adf(file_path, &floppy_data, &floppy_size)) {
-            log_message(RETRO_LOG_ERROR, "Failed to load ADF file\n");
-            send_message("Failed to load ADF file");
-            memory_destroy(memory);
-            memory = nullptr;
-            return false;
-        }
-        log_message(RETRO_LOG_INFO, "ADF loaded as floppy data: %zu bytes\n", floppy_size);
-    } else if (is_jfd) {
-        log_message(RETRO_LOG_WARN, "JFD file provided but treated as ADF for now\n");
-        if (!decompress_jfd(file_path, &floppy_data, &floppy_size)) {
-            log_message(RETRO_LOG_ERROR, "Failed to decompress JFD file\n");
-            send_message("Failed to decompress JFD file");
-            memory_destroy(memory);
-            memory = nullptr;
-            return false;
-        }
     }
 
     cpu = cpu_create(memory);
@@ -307,13 +142,11 @@ bool retro_load_game(const struct retro_game_info* game) {
         send_message("Failed to create CPU");
         memory_destroy(memory);
         memory = nullptr;
-        if (floppy_data) free(floppy_data);
-        floppy_data = nullptr;
         return false;
     }
 
-    log_message(RETRO_LOG_INFO, "Successfully loaded game: %s with ROM: %s\n", file_path, rom_path);
-    send_message("Game and ROM loaded successfully");
+    log_message(RETRO_LOG_INFO, "Successfully loaded ROM: %s at 0x%08X\n", rom_path, memory->rom_base);
+    send_message("ROM loaded successfully");
     return true;
 }
 
@@ -328,6 +161,7 @@ void retro_deinit(void) {
     running = false;
     if (cpu) { cpu_destroy(cpu); cpu = nullptr; }
     if (memory) { memory_destroy(memory); memory = nullptr; }
+    if (io) { io_destroy(io); io = nullptr; }
     if (frame_buffer) { free(frame_buffer); frame_buffer = nullptr; }
     if (floppy_data) { free(floppy_data); floppy_data = nullptr; }
 }
@@ -348,8 +182,8 @@ void retro_get_system_info(struct retro_system_info* info) {
     memset(info, 0, sizeof(*info));
     info->library_name = "Acorn Archimedes Emulator (ARM3)";
     info->library_version = "1.0";
-    info->valid_extensions = "jfd|adf";
-    info->need_fullpath = true;
+    info->valid_extensions = ""; // No extensions needed
+    info->need_fullpath = false; // No content file required
     info->block_extract = false;
 }
 
@@ -374,7 +208,7 @@ void retro_run(void) {
     handle_input();
 
     for (unsigned i = 0; i < 160000; i++) {
-        uint32_t pc = cpu->registers[15] & 0x03FFFFFF;
+        uint32_t pc = cpu->registers[15] & ADDR_MASK;
         if (pc > ADDR_MASK) {
             log_message(RETRO_LOG_ERROR, "PC out of bounds: %08x at step %u\n", cpu->registers[15], i);
             running = false;
@@ -407,6 +241,8 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code) {
 
 void retro_unload_game(void) { /* No-op */ }
 
+} // End of extern "C"
+
 static void handle_input(void) {
     if (input_state_cb && input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_ESCAPE)) {
         log_message(RETRO_LOG_INFO, "Escape key pressed, stopping emulation\n");
@@ -418,7 +254,7 @@ static void render_frame(void) {
     if (!frame_buffer) return;
     for (unsigned y = 0; y < HEIGHT; y++) {
         for (unsigned x = 0; x < WIDTH; x++) {
-            frame_buffer[y * WIDTH + x] = (uint16_t)((x + y + (clock() / 1000)) & 0xFFFF);
+            frame_buffer[y * WIDTH + x] = (uint16_t)((x + y + (clock() / 1000)) & 0xFFFF); // Test pattern
         }
     }
 }

@@ -4,20 +4,27 @@
 #include <cstdint>
 #include <cstddef> // Added for size_t
 
-#define RAM_BASE    0x00000000
-#define RAM_SIZE    (4 * 1024 * 1024) // 4MB (ARM3 A400 series standard)
-#define IO_BASE     0x03200000
-#define IO_SIZE     (2 * 1024 * 1024) // 2MB
-#define ROM_BASE    0x03400000
-#define ROM_SIZE    (512 * 1024)      // 512KB (RISC OS 3.1x ROM size)
-#define ADDR_MASK   0x03FFFFFF        // 26-bit address space
+// Forward declaration of struct io (to avoid circular dependency with io.h)
+struct io;
 
-typedef struct memory memory_t;
+#define RAM_SIZE (2 * 1024 * 1024) // 2MB
+#define ROM_SIZE (2 * 1024 * 1024) // 2MB
+#define RAM_BASE 0x00000000
+#define ROM_DEFAULT_BASE 0x03800000
+#define IO_BASE 0x02000000
+#define IO_SIZE 0x02000000
+#define ADDR_MASK 0x03FFFFFF // 26-bit address space
 
-extern uint8_t* floppy_data;
-extern size_t floppy_size;
+typedef struct memory {
+    uint8_t* ram;
+    uint8_t* rom;
+    size_t rom_size;
+    uint32_t rom_base;
+    uint32_t floppy_offset;
+    struct io* io;
+} memory_t;
 
-memory_t* memory_create(const char* jfd_path);
+memory_t* memory_create(const char* jfd_path, uint32_t rom_base, struct io* io);
 void memory_destroy(memory_t* mem);
 uint32_t memory_read_word(memory_t* mem, uint32_t address);
 void memory_write_word(memory_t* mem, uint32_t address, uint32_t value);
