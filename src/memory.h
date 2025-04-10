@@ -22,6 +22,7 @@ typedef struct memory {
     uint32_t rom_base;
     uint32_t floppy_offset;
     struct io* io;
+	int is_boot_mode; // 1 at boot, 0 after initialization
 } memory_t;
 
 memory_t* memory_create(const char* jfd_path, uint32_t rom_base, struct io* io);

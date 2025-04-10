@@ -147,7 +147,8 @@ void cpu_step(arm3_cpu_t* cpu) {
     uint32_t fetch_pc = cpu->registers[15] & ADDR_MASK;
     uint32_t instr = memory_read_word(cpu->mem, fetch_pc);
     if (instr == 0xFFFFFFFF) {
-        printf("0x%08X: Invalid read\n", fetch_pc);
+        printf("Invalid read at 0x%08X (PC: 0x%08X, r0: 0x%08X, r1: 0x%08X, r14: 0x%08X, CPSR: 0x%08X)\n", 
+               fetch_pc, cpu->registers[15], cpu->registers[0], cpu->registers[1], cpu->registers[14], cpu->cpsr);
         return;
     }
 
@@ -206,6 +207,14 @@ void cpu_step(arm3_cpu_t* cpu) {
     }
     printf("0x%08X: 0x%08X  ; %s\n", fetch_pc, instr, disasm);
 
+    // Debug r0 before entering the problematic loop
+    if (fetch_pc >= 0x0380A200 && fetch_pc < 0x0380A258) {
+        printf("Pre-loop r0: 0x%08X at 0x%08X\n", cpu->registers[0], fetch_pc);
+    }
+    if (fetch_pc == 0x0380A258) {
+        printf("STR target: 0x%08X (r0: 0x%08X, r2: 0x%08X)\n", 
+               cpu->registers[0] + 1, cpu->registers[0], cpu->registers[2]);
+    }
     if (fetch_pc == 0x0380A5F4) {
         printf("  r2: 0x%08X\n", cpu->registers[2]);
     }
@@ -221,12 +230,18 @@ void cpu_step(arm3_cpu_t* cpu) {
         printf("Exiting Loop 1 at 0x0380A250, r3: 0x%08X, r5: 0x%08X\n", cpu->registers[3], cpu->registers[5]);
     }
 
+    // Boot trace for ROM and early RAM execution
+    if ((fetch_pc >= 0x03800000 && fetch_pc <= 0x0380FFFF) || 
+        (fetch_pc >= 0x00E00000 && fetch_pc <= 0x00E0FFFF)) {
+        printf("Boot trace: PC: 0x%08X, r0: 0x%08X, opcode: 0x%08X\n", fetch_pc, cpu->registers[0], instr);
+    }
+
     log_counter++;
     total_steps++;
     cpu->registers[15] += 4;
 
-    if (total_steps >= 10000) {
-        printf("Stopped after 10000 steps to limit log size\n");
+    if (total_steps >= 1000000) {
+        printf("Stopped after 1000000 steps to limit log size (boot mode: %d)\n", cpu->mem->is_boot_mode);
         exit(1);
     }
 
@@ -257,9 +272,9 @@ void cpu_step(arm3_cpu_t* cpu) {
     }
     if (fetch_pc == 0x0380A268) {
         new_loop_count++;
-        if (new_loop_count >= 5) {
+        if (new_loop_count >= 5000) {
             cpu->registers[15] = 0x0380A26C;
-            printf("Exited new loop at 0x0380A268 after 5 iterations\n");
+            printf("Exited new loop at 0x0380A268 after 5000 iterations\n");
             new_loop_count = 0;
         }
     }
@@ -287,7 +302,7 @@ void cpu_step(arm3_cpu_t* cpu) {
         return;
     }
 
-    if ((instr & 0x0C000000) == 0x00000000) {
+	if ((instr & 0x0C000000) == 0x00000000) {
         uint32_t opcode = (instr >> 21) & 0xF;
         uint32_t rn = (instr >> 16) & 0xF;
         uint32_t rd = (instr >> 12) & 0xF;
@@ -426,6 +441,6 @@ void cpu_step(arm3_cpu_t* cpu) {
         printf("SWI at 0x%08X, comment: 0x%06X\n", fetch_pc, instr & 0xFFFFFF);
     }
     else {
-        printf("Unimplemented instruction 0x%08X at 0x%08X\n", instr, fetch_pc);
+        printf("Unimplemented instruction 0x%08X at 0x%08X\n", fetch_pc, instr);
     }
 }
