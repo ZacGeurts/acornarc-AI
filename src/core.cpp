@@ -18,9 +18,8 @@ static arm3_cpu_t* cpu = nullptr;
 static memory_t* memory = nullptr;
 static io_t* io = nullptr;
 static bool running = false;
-static uint16_t* frame_buffer = nullptr;
-static const unsigned WIDTH = 320;
-static const unsigned HEIGHT = 256;
+static const unsigned DEFAULT_WIDTH = 640;  // Match VIDC default
+static const unsigned DEFAULT_HEIGHT = 480; // Match VIDC default
 
 static retro_video_refresh_t video_cb;
 static retro_input_poll_t input_poll_cb;
@@ -30,7 +29,6 @@ static retro_log_printf_t log_cb = nullptr;
 static bool pixel_format_set = false;
 
 static void handle_input(void);
-static void render_frame(void);
 
 static void fallback_log(const char* fmt, ...) {
     va_list args;
@@ -96,27 +94,12 @@ void retro_set_environment(retro_environment_t cb) {
 void retro_init(void) {
     log_message(RETRO_LOG_INFO, "retro_init called\n");
 
-    io = io_create();
+    io = io_create(DEFAULT_WIDTH, DEFAULT_HEIGHT); // Initialize with default resolution
     if (!io) {
         log_message(RETRO_LOG_ERROR, "Failed to initialize I/O module\n");
         send_message("Core failed to initialize I/O module");
         running = false;
         return;
-    }
-
-    frame_buffer = (uint16_t*)malloc(WIDTH * HEIGHT * sizeof(uint16_t));
-    if (!frame_buffer) {
-        log_message(RETRO_LOG_ERROR, "Failed to allocate frame buffer\n");
-        send_message("Core failed to allocate frame buffer");
-        io_destroy(io);
-        io = nullptr;
-        running = false;
-        return;
-    }
-
-    memset(frame_buffer, 0, WIDTH * HEIGHT * sizeof(uint16_t));
-    for (unsigned i = 0; i < WIDTH * HEIGHT; i++) {
-        frame_buffer[i] = 0xF800; // Red screen for now
     }
 
     running = true;
@@ -128,7 +111,7 @@ bool retro_load_game(const struct retro_game_info* game) {
     log_message(RETRO_LOG_INFO, "retro_load_game called\n");
 
     const char* rom_path = "riscos.rom"; 
-    uint32_t rom_base = 0x03800000; // Updated to match new ROM_DEFAULT_BASE
+    uint32_t rom_base = 0x03800000; // Updated to match ROM_DEFAULT_BASE
     memory = memory_create(rom_path, rom_base, io);
     if (!memory) {
         log_message(RETRO_LOG_ERROR, "Failed to create memory system with ROM: %s at 0x%08X\n", rom_path, rom_base);
@@ -143,6 +126,12 @@ bool retro_load_game(const struct retro_game_info* game) {
         memory_destroy(memory);
         memory = nullptr;
         return false;
+    }
+
+    // Write test data to video memory (assuming 4 bits per pixel)
+    uint8_t* video_mem = memory->ram + (io->vidc.video_base - RAM_BASE);
+    for (uint32_t i = 0; i < io->frame_width * io->frame_height; i++) {
+        video_mem[i] = (i % 16); // Cycle through palette entries 0-15
     }
 
     log_message(RETRO_LOG_INFO, "Successfully loaded ROM: %s at 0x%08X\n", rom_path, memory->rom_base);
@@ -162,7 +151,6 @@ void retro_deinit(void) {
     if (cpu) { cpu_destroy(cpu); cpu = nullptr; }
     if (memory) { memory_destroy(memory); memory = nullptr; }
     if (io) { io_destroy(io); io = nullptr; }
-    if (frame_buffer) { free(frame_buffer); frame_buffer = nullptr; }
     if (floppy_data) { free(floppy_data); floppy_data = nullptr; }
 }
 
@@ -188,25 +176,59 @@ void retro_get_system_info(struct retro_system_info* info) {
 }
 
 void retro_get_system_av_info(struct retro_system_av_info* info) {
-    info->geometry.base_width = WIDTH;
-    info->geometry.base_height = HEIGHT;
-    info->geometry.max_width = WIDTH;
-    info->geometry.max_height = HEIGHT;
-    info->geometry.aspect_ratio = (float)WIDTH / HEIGHT;
+    info->geometry.base_width = DEFAULT_WIDTH;
+    info->geometry.base_height = DEFAULT_HEIGHT;
+    info->geometry.max_width = DEFAULT_WIDTH;
+    info->geometry.max_height = DEFAULT_HEIGHT;
+    info->geometry.aspect_ratio = (float)DEFAULT_WIDTH / DEFAULT_HEIGHT;
     info->timing.fps = 50.0;
     info->timing.sample_rate = 44100.0;
 }
 
 unsigned retro_get_region(void) { return RETRO_REGION_PAL; }
-void* retro_get_memory_data(unsigned id) { return nullptr; }
-size_t retro_get_memory_size(unsigned id) { return 0; }
+
+void* retro_get_memory_data(unsigned id) {
+    if (id == RETRO_MEMORY_SYSTEM_RAM && memory) {
+        return memory->ram;
+    }
+    return nullptr;
+}
+
+size_t retro_get_memory_size(unsigned id) {
+    if (id == RETRO_MEMORY_SYSTEM_RAM) {
+        return RAM_SIZE;
+    }
+    return 0;
+}
 
 void retro_run(void) {
-    if (!running || !cpu || !memory) return;
+    if (!running || !cpu || !memory || !io) return;
 
     input_poll_cb();
     handle_input();
 
+    // Update timers and check for interrupts
+    io_update_timers(io);
+
+    // Check for interrupts and handle them
+    if (io_get_irq(io) && !(cpu->cpsr & PSR_I)) {
+        // IRQ: Save CPSR, switch to IRQ mode, disable IRQs, jump to vector
+        cpu->spsr = cpu->spsr_irq = cpu->cpsr; // Save CPSR to IRQ mode SPSR
+        cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_IRQ | PSR_I;
+        cpu->registers[14] = cpu->registers[15] + 4; // Save return address (PC + 4)
+        cpu->registers[15] = 0x00000018 & ADDR_MASK; // IRQ vector
+        log_message(RETRO_LOG_INFO, "IRQ triggered\n");
+    }
+    if (io_get_fiq(io) && !(cpu->cpsr & PSR_F)) {
+        // FIQ: Save CPSR, switch to FIQ mode, disable FIQs, jump to vector
+        cpu->spsr = cpu->spsr_fiq = cpu->cpsr; // Save CPSR to FIQ mode SPSR
+        cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_FIQ | PSR_F;
+        cpu->registers[14] = cpu->registers[15] + 4; // Save return address (PC + 4)
+        cpu->registers[15] = 0x0000001C & ADDR_MASK; // FIQ vector
+        log_message(RETRO_LOG_INFO, "FIQ triggered\n");
+    }
+
+    // Execute CPU cycles (160,000 cycles per frame at 8MHz, 50Hz)
     for (unsigned i = 0; i < 160000; i++) {
         uint32_t pc = cpu->registers[15] & ADDR_MASK;
         if (pc > ADDR_MASK) {
@@ -218,9 +240,9 @@ void retro_run(void) {
         cpu_step(cpu);
     }
 
-    render_frame();
-    if (video_cb && frame_buffer) {
-        video_cb(frame_buffer, WIDTH, HEIGHT, WIDTH * sizeof(uint16_t));
+    // Render the frame using the VIDC implementation
+    if (video_cb && io) {
+        io_render_frame(io, memory, video_cb);
     }
 }
 
@@ -248,13 +270,11 @@ static void handle_input(void) {
         log_message(RETRO_LOG_INFO, "Escape key pressed, stopping emulation\n");
         running = false;
     }
-}
-
-static void render_frame(void) {
-    if (!frame_buffer) return;
-    for (unsigned y = 0; y < HEIGHT; y++) {
-        for (unsigned x = 0; x < WIDTH; x++) {
-            frame_buffer[y * WIDTH + x] = (uint16_t)((x + y + (clock() / 1000)) & 0xFFFF); // Test pattern
+    // Add more key mappings as needed
+    if (input_state_cb) {
+        if (input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_SPACE)) {
+            log_message(RETRO_LOG_INFO, "Space key pressed\n");
+            // Simulate a key press in IOC (placeholder)
         }
     }
 }

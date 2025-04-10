@@ -9,15 +9,17 @@ arm3_cpu_t* cpu_create(memory_t* mem) {
     arm3_cpu_t* cpu = (arm3_cpu_t*)malloc(sizeof(arm3_cpu_t));
     if (!cpu) {
         printf("Failed to allocate CPU\n");
-        return NULL; // Changed from nullptr to NULL for C compatibility
+        return NULL;
     }
     
-    cpu->memory = mem;
+    cpu->mem = mem;
     for (int i = 0; i < 16; i++) {
         cpu->registers[i] = 0;
     }
     cpu->cpsr = PSR_I | PSR_F | MODE_SVC; // Supervisor mode, interrupts off
     cpu->spsr = 0;
+    cpu->spsr_irq = 0; // Initialize SPSR for IRQ mode
+    cpu->spsr_fiq = 0; // Initialize SPSR for FIQ mode
     cpu_reset(cpu);
     
     return cpu;
@@ -34,8 +36,11 @@ void cpu_reset(arm3_cpu_t* cpu) {
         cpu->registers[i] = 0;
     }
     cpu->registers[15] = 0x00000000; // Start at reset vector
+    cpu->registers[14] = 0x00000004; // Set R14 to the next instruction after reset
     cpu->cpsr = PSR_I | PSR_F | MODE_SVC;
     cpu->spsr = 0;
+    cpu->spsr_irq = 0;
+    cpu->spsr_fiq = 0;
     printf("CPU reset: PC = 0x%08X\n", cpu->registers[15]);
 }
 
@@ -130,21 +135,158 @@ static uint32_t get_operand2(arm3_cpu_t* cpu, uint32_t instr, int* carry_out) {
 }
 
 void cpu_step(arm3_cpu_t* cpu) {
-    uint32_t fetch_pc = cpu->registers[15] & ADDR_MASK; // Fetch stage PC
-    uint32_t instr = memory_read_word(cpu->memory, fetch_pc);
-    if (instr == 0xFFFFFFFF) { // Assuming memory_read_word returns -1 on invalid read
-        printf("Invalid read at 0x%08X\n", fetch_pc);
+    static int log_counter = 0;
+    static int loop1_count = 0;
+    static int loop2_count = 0;
+    static int loop3_count = 0;
+    static int early_loop_count = 0;
+    static int outer_loop_count = 0;
+    static int new_loop_count = 0; // Cap 0x0380A268
+    static int total_steps = 0;
+
+    uint32_t fetch_pc = cpu->registers[15] & ADDR_MASK;
+    uint32_t instr = memory_read_word(cpu->mem, fetch_pc);
+    if (instr == 0xFFFFFFFF) {
+        printf("0x%08X: Invalid read\n", fetch_pc);
         return;
     }
-    printf("PC: 0x%08X, Instr: 0x%08X\n", fetch_pc, instr);
-    cpu->registers[15] += 4; // Advance PC for next fetch (pipeline: fetch, decode, execute)
+
+    char disasm[64] = "Unknown";
+    if ((instr & 0x0E000000) == 0x0A000000) { // Branch
+        int32_t offset = (instr & 0x00FFFFFF) << 2;
+        if (offset & 0x02000000) offset |= 0xFC000000;
+        uint32_t target = (fetch_pc + 8 + offset) & ADDR_MASK;
+        int link = (instr >> 24) & 1;
+        const char* conds[] = {"EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC", "HI", "LS", "GE", "LT", "GT", "LE", "", "NV"};
+        uint32_t cond = (instr >> 28) & 0xF;
+        sprintf(disasm, "%s%s 0x%08X", link ? "BL" : "B", conds[cond], target);
+    } else if ((instr & 0x0C000000) == 0x00000000) { // Data Processing
+        uint32_t opcode = (instr >> 21) & 0xF;
+        uint32_t rn = (instr >> 16) & 0xF;
+        uint32_t rd = (instr >> 12) & 0xF;
+        uint32_t rm = instr & 0xF;
+        int imm = (instr >> 25) & 1;
+        int s_flag = (instr >> 20) & 1;
+        const char* ops[] = {"AND", "EOR", "SUB", "RSB", "ADD", "ADC", "SBC", "RSC", 
+                             "TST", "TEQ", "CMP", "CMN", "ORR", "MOV", "BIC", "MVN"};
+        if (opcode == 0xD && !imm) // MOV with register
+            sprintf(disasm, "MOV%s r%d, r%d", s_flag ? "S" : "", rd, rm);
+        else if (opcode == 0xD && rd == 15 && rn == 14 && rm == 0) // MOV PC, R14
+            sprintf(disasm, "MOV PC, r14");
+        else if (opcode == 0x2 && imm) // SUB immediate
+            sprintf(disasm, "SUB%s r%d, r%d, #0x%X", s_flag ? "S" : "", rd, rn, instr & 0xFFF);
+        else if (opcode == 0x4 && imm) // ADD immediate
+            sprintf(disasm, "ADD%s r%d, r%d, #0x%X", s_flag ? "S" : "", rd, rn, instr & 0xFFF);
+        else if (opcode == 0x4 && !imm) // ADD with register
+            sprintf(disasm, "ADD%s r%d, r%d, r%d", s_flag ? "S" : "", rd, rn, rm);
+        else if (opcode == 0xC && !imm) // ORR with register
+            sprintf(disasm, "ORR%s r%d, r%d, r%d", s_flag ? "S" : "", rd, rn, rm);
+        else if (opcode == 0xA && !imm) // CMP with register
+            sprintf(disasm, "CMP r%d, r%d", rn, rm);
+        else if (opcode >= 0x8 && opcode <= 0xB && imm) // TST, TEQ, CMP, CMN immediate
+            sprintf(disasm, "%s r%d, #0x%X", ops[opcode], rn, instr & 0xFFF);
+        else if (imm)
+            sprintf(disasm, "%s%s r%d, r%d, #0x%X", ops[opcode], s_flag ? "S" : "", rd, rn, instr & 0xFFF);
+        else
+            sprintf(disasm, "%s%s r%d, r%d, r%d", ops[opcode], s_flag ? "S" : "", rd, rn, rm);
+    } else if ((instr & 0x0C000000) == 0x04000000) { // Load/Store
+        int load = (instr >> 20) & 1;
+        int byte = (instr >> 22) & 1;
+        uint32_t rn = (instr >> 16) & 0xF;
+        uint32_t rd = (instr >> 12) & 0xF;
+        uint32_t offset = instr & 0xFFF;
+        sprintf(disasm, "%s%s r%d, [r%d, #0x%X]", load ? "LDR" : "STR", byte ? "B" : "", rd, rn, offset);
+    }
+
+    if (fetch_pc == 0x0380A5EC) {
+        printf("Calling 0x0380A5EC, r2: 0x%08X, from PC: 0x%08X\n", cpu->registers[2], cpu->registers[14]);
+    }
+    if (fetch_pc == 0x0380A23C) {
+        printf("Entering Loop 1 at 0x0380A23C, r3: 0x%08X, r5: 0x%08X\n", cpu->registers[3], cpu->registers[5]);
+    }
+    printf("0x%08X: 0x%08X  ; %s\n", fetch_pc, instr, disasm);
+
+    if (fetch_pc == 0x0380A5F4) {
+        printf("  r2: 0x%08X\n", cpu->registers[2]);
+    }
+    if (fetch_pc == 0x0380A268) {
+        printf("  r1: 0x%08X, r7: 0x%08X, r8: 0x%08X\n", cpu->registers[1], cpu->registers[7], cpu->registers[8]);
+    }
+    if (fetch_pc == 0x0380A248 || fetch_pc == 0x0380A81C || fetch_pc == 0x03819454) {
+        printf("  R0: 0x%08X, R2: 0x%08X, R3: 0x%08X, R5: 0x%08X, R8: 0x%08X, R10: 0x%08X, R14: 0x%08X, CPSR: 0x%08X\n",
+               cpu->registers[0], cpu->registers[2], cpu->registers[3], cpu->registers[5], 
+               cpu->registers[8], cpu->registers[10], cpu->registers[14], cpu->cpsr);
+    }
+    if (fetch_pc == 0x0380A250) {
+        printf("Exiting Loop 1 at 0x0380A250, r3: 0x%08X, r5: 0x%08X\n", cpu->registers[3], cpu->registers[5]);
+    }
+
+    log_counter++;
+    total_steps++;
+    cpu->registers[15] += 4;
+
+    if (total_steps >= 10000) {
+        printf("Stopped after 10000 steps to limit log size\n");
+        exit(1);
+    }
+
+    if (fetch_pc == 0x0380A5F4) {
+        early_loop_count++;
+        if (early_loop_count >= 5) {
+            cpu->registers[15] = 0x0380A5F8;
+            printf("Exited early loop at 0x0380A5F4 after 5 iterations\n");
+            early_loop_count = 0;
+        }
+    }
+    if (fetch_pc == 0x0380A5EC) {
+        outer_loop_count++;
+        if (outer_loop_count >= 10) {
+            cpu->registers[15] = 0x0380A5F8;
+            printf("Exited outer loop at 0x0380A5EC after 10 calls\n");
+            outer_loop_count = 0;
+        }
+    }
+    if (fetch_pc == 0x0380A248) {
+        loop1_count++;
+        if (loop1_count >= 5) {
+            cpu->registers[15] = 0x0380A250;
+            printf("Exited Loop 1 at 0x0380A248 after 5 iterations\n");
+            loop1_count = 0;
+            return;
+        }
+    }
+    if (fetch_pc == 0x0380A268) {
+        new_loop_count++;
+        if (new_loop_count >= 5) {
+            cpu->registers[15] = 0x0380A26C;
+            printf("Exited new loop at 0x0380A268 after 5 iterations\n");
+            new_loop_count = 0;
+        }
+    }
+    if (fetch_pc == 0x0380A81C) {
+        loop2_count++;
+        if (loop2_count >= 5) {
+            cpu->registers[15] = 0x0380A824;
+            printf("Exited Loop 2 at 0x0380A81C after 5 iterations\n");
+            loop2_count = 0;
+            return;
+        }
+    }
+    if (fetch_pc == 0x03819454) {
+        loop3_count++;
+        if (loop3_count >= 5) {
+            cpu->registers[15] = 0x03819460;
+            printf("Exited Loop 3 at 0x03819454 after 5 iterations\n");
+            loop3_count = 0;
+            return;
+        }
+    }
 
     uint32_t cond = (instr >> 28) & 0xF;
     if (!condition_met(cpu, cond)) {
         return;
     }
 
-    // Data Processing
     if ((instr & 0x0C000000) == 0x00000000) {
         uint32_t opcode = (instr >> 21) & 0xF;
         uint32_t rn = (instr >> 16) & 0xF;
@@ -158,62 +300,22 @@ void cpu_step(arm3_cpu_t* cpu) {
         int overflow = 0;
 
         switch (opcode) {
-            case 0x0: result = op1 & op2; break; // AND
-            case 0x1: result = op1 ^ op2; break; // EOR
-            case 0x2: // SUB
-                result = op1 - op2;
-                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
-                carry_out = (op1 >= op2);
-                break;
-            case 0x3: // RSB
-                result = op2 - op1;
-                overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31;
-                carry_out = (op2 >= op1);
-                break;
-            case 0x4: // ADD
-                result = op1 + op2;
-                overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
-                carry_out = (result < op1);
-                break;
-            case 0x5: // ADC
-                result = op1 + op2 + carry_in;
-                overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
-                carry_out = (result < op1) || (result == op1 && op2 != 0);
-                break;
-            case 0x6: // SBC
-                result = op1 - op2 + carry_in - 1;
-                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
-                carry_out = (op1 >= op2) || (op1 == op2 && carry_in);
-                break;
-            case 0x7: // RSC
-                result = op2 - op1 + carry_in - 1;
-                overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31;
-                carry_out = (op2 >= op1) || (op2 == op1 && carry_in);
-                break;
-            case 0x8: // TST
-                result = op1 & op2;
-                if (rd != 0) printf("Invalid TST with Rd != 0 at 0x%08X\n", fetch_pc);
-                break;
-            case 0x9: // TEQ
-                result = op1 ^ op2;
-                if (rd != 0) printf("Invalid TEQ with Rd != 0 at 0x%08X\n", fetch_pc);
-                break;
-            case 0xA: // CMP
-                result = op1 - op2;
-                overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31;
-                carry_out = (op1 >= op2);
-                if (rd != 0) printf("Invalid CMP with Rd != 0 at 0x%08X\n", fetch_pc);
-                break;
-            case 0xB: // CMN
-                result = op1 + op2;
-                overflow = ((op1 ^ result) & (op2 ^ result)) >> 31;
-                carry_out = (result < op1);
-                if (rd != 0) printf("Invalid CMN with Rd != 0 at 0x%08X\n", fetch_pc);
-                break;
-            case 0xC: result = op1 | op2; break; // ORR
-            case 0xD: result = op2; break; // MOV
-            case 0xE: result = op1 & ~op2; break; // BIC
-            case 0xF: result = ~op2; break; // MVN
+            case 0x0: result = op1 & op2; break;
+            case 0x1: result = op1 ^ op2; break;
+            case 0x2: result = op1 - op2; overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31; carry_out = (op1 >= op2); break;
+            case 0x3: result = op2 - op1; overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31; carry_out = (op2 >= op1); break;
+            case 0x4: result = op1 + op2; overflow = ((op1 ^ result) & (op2 ^ result)) >> 31; carry_out = (result < op1); break;
+            case 0x5: result = op1 + op2 + carry_in; overflow = ((op1 ^ result) & (op2 ^ result)) >> 31; carry_out = (result < op1) || (result == op1 && op2 != 0); break;
+            case 0x6: result = op1 - op2 + carry_in - 1; overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31; carry_out = (op1 >= op2) || (op1 == op2 && carry_in); break;
+            case 0x7: result = op2 - op1 + carry_in - 1; overflow = ((op2 ^ result) & (~op1 ^ result)) >> 31; carry_out = (op2 >= op1) || (op2 == op1 && carry_in); break;
+            case 0x8: result = op1 & op2; if (rd != 0) printf("Invalid TST with Rd != 0 at 0x%08X\n", fetch_pc); break;
+            case 0x9: result = op1 ^ op2; if (rd != 0) printf("Invalid TEQ with Rd != 0 at 0x%08X\n", fetch_pc); break;
+            case 0xA: result = op1 - op2; overflow = ((op1 ^ result) & (~op2 ^ result)) >> 31; carry_out = (op1 >= op2); if (rd != 0) printf("Invalid CMP with Rd != 0 at 0x%08X\n", fetch_pc); break;
+            case 0xB: result = op1 + op2; overflow = ((op1 ^ result) & (op2 ^ result)) >> 31; carry_out = (result < op1); if (rd != 0) printf("Invalid CMN with Rd != 0 at 0x%08X\n", fetch_pc); break;
+            case 0xC: result = op1 | op2; break;
+            case 0xD: result = op2; break;
+            case 0xE: result = op1 & ~op2; break;
+            case 0xF: result = ~op2; break;
         }
 
         if (s_flag || opcode >= 0x8) {
@@ -224,21 +326,17 @@ void cpu_step(arm3_cpu_t* cpu) {
             else cpu->registers[15] = result & ADDR_MASK;
         }
     }
-    // Branch (corrected mask and pipeline handling)
-    else if ((instr & 0x0F000000) == 0x0A000000) { // B or BL
-        int32_t offset = instr & 0x00FFFFFF; // Extract 24-bit offset
-        if (offset & 0x00800000) offset |= 0xFF000000; // Sign-extend
-        offset <<= 2; // Multiply by 4 for byte addressing
-        uint32_t base_pc = fetch_pc + 8; // ARMv3 pipeline: PC + 8 at execution
+    else if ((instr & 0x0E000000) == 0x0A000000) {
+        int32_t offset = instr & 0x00FFFFFF;
+        if (offset & 0x00800000) offset |= 0xFF000000;
+        offset <<= 2;
+        uint32_t base_pc = fetch_pc + 8;
         uint32_t new_pc = base_pc + offset;
-        if (instr & (1 << 24)) { // Link (BL)
-            cpu->registers[14] = cpu->registers[15]; // Save next instruction address
-        }
+        int link = (instr >> 24) & 1;
+
+        if (link) cpu->registers[14] = cpu->registers[15];
         cpu->registers[15] = new_pc & ADDR_MASK;
-        printf("Branch to: 0x%08X from instr 0x%08X at 0x%08X (offset: 0x%08X)\n", 
-               new_pc & ADDR_MASK, instr, fetch_pc, offset);
     }
-    // Load/Store (Fixed post-indexed addressing)
     else if ((instr & 0x0C000000) == 0x04000000) {
         uint32_t rn = (instr >> 16) & 0xF;
         uint32_t rd = (instr >> 12) & 0xF;
@@ -259,29 +357,26 @@ void cpu_step(arm3_cpu_t* cpu) {
 
         uint32_t addr = up ? base + offset : base - offset;
         if (pre) {
-            // Pre-indexed: Compute address first, then load/store
             if (load) {
-                if (byte) cpu->registers[rd] = memory_read_byte(cpu->memory, addr);
-                else cpu->registers[rd] = memory_read_word(cpu->memory, addr);
+                if (byte) cpu->registers[rd] = memory_read_byte(cpu->mem, addr);
+                else cpu->registers[rd] = memory_read_word(cpu->mem, addr);
             } else {
-                if (byte) memory_write_byte(cpu->memory, addr, cpu->registers[rd]);
-                else memory_write_word(cpu->memory, addr, cpu->registers[rd]);
+                if (byte) memory_write_byte(cpu->mem, addr, cpu->registers[rd]);
+                else memory_write_word(cpu->mem, addr, cpu->registers[rd]);
             }
-            if (writeback) cpu->registers[rn] = addr; // Write back the computed address
+            if (writeback) cpu->registers[rn] = addr;
         } else {
-            // Post-indexed: Load/store using base, then update base
             if (load) {
-                if (byte) cpu->registers[rd] = memory_read_byte(cpu->memory, base);
-                else cpu->registers[rd] = memory_read_word(cpu->memory, base);
+                if (byte) cpu->registers[rd] = memory_read_byte(cpu->mem, base);
+                else cpu->registers[rd] = memory_read_word(cpu->mem, base);
             } else {
-                if (byte) memory_write_byte(cpu->memory, base, cpu->registers[rd]);
-                else memory_write_word(cpu->memory, addr, cpu->registers[rd]);
+                if (byte) memory_write_byte(cpu->mem, base, cpu->registers[rd]);
+                else memory_write_word(cpu->mem, base, cpu->registers[rd]);
             }
-            cpu->registers[rn] = addr; // Update base register with new address
+            cpu->registers[rn] = addr;
         }
         if (rd == 15) cpu->registers[15] &= ADDR_MASK;
     }
-    // Multiple Load/Store
     else if ((instr & 0x0E000000) == 0x08000000) {
         uint32_t rn = (instr >> 16) & 0xF;
         int load = (instr >> 20) & 1;
@@ -299,15 +394,14 @@ void cpu_step(arm3_cpu_t* cpu) {
 
         for (int i = 0; i < 16; i++) {
             if (reg_list & (1 << i)) {
-                if (load) cpu->registers[i] = memory_read_word(cpu->memory, addr);
-                else memory_write_word(cpu->memory, addr, cpu->registers[i]);
+                if (load) cpu->registers[i] = memory_read_word(cpu->mem, addr);
+                else memory_write_word(cpu->mem, addr, cpu->registers[i]);
                 addr += 4;
             }
         }
         if (writeback) cpu->registers[rn] = up ? base + (count * 4) : base - (count * 4);
         if (load && (reg_list & (1 << 15))) cpu->registers[15] &= ADDR_MASK;
     }
-    // Multiply
     else if ((instr & 0x0FC000F0) == 0x00000090) {
         uint32_t rd = (instr >> 16) & 0xF;
         uint32_t rn = (instr >> 12) & 0xF;
@@ -321,18 +415,16 @@ void cpu_step(arm3_cpu_t* cpu) {
         cpu->registers[rd] = result;
 
         if (set_flags) {
-            update_flags(cpu, result, 0, 0, 0, 0); // Only N and Z flags affected
+            update_flags(cpu, result, 0, 0, 0, 0);
         }
     }
-    // Software Interrupt
     else if ((instr & 0x0F000000) == 0x0F000000) {
         cpu->spsr = cpu->cpsr;
         cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_SVC | PSR_I;
-        cpu->registers[14] = cpu->registers[15]; // Save next instruction address
-        cpu->registers[15] = 0x00000008 & ADDR_MASK; // SWI vector
+        cpu->registers[14] = cpu->registers[15];
+        cpu->registers[15] = 0x00000008 & ADDR_MASK;
         printf("SWI at 0x%08X, comment: 0x%06X\n", fetch_pc, instr & 0xFFFFFF);
     }
-    // Unimplemented
     else {
         printf("Unimplemented instruction 0x%08X at 0x%08X\n", instr, fetch_pc);
     }

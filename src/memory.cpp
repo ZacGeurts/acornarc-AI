@@ -59,6 +59,9 @@ void memory_destroy(memory_t* mem) {
 }
 
 uint32_t memory_read_word(memory_t* mem, uint32_t address) {
+    static uint32_t last_logged_address = 0xFFFFFFFF;
+    static int log_counter = 0;
+
     address &= ADDR_MASK;
     // Alias ROM at 0x02000000 and 0x00000000 to match Acorn Archimedes boot behavior
     if ((address >= 0x02000000 && address < 0x02200000) || 
@@ -66,7 +69,14 @@ uint32_t memory_read_word(memory_t* mem, uint32_t address) {
         uint32_t rom_offset = (address & 0x001FFFFF) % mem->rom_size; // Wrap around ROM size
         if (rom_offset <= mem->rom_size - 4) {
             uint32_t* ptr = (uint32_t*)(mem->rom + rom_offset);
-            printf("ROM alias read at 0x%08X (offset 0x%08X): 0x%08X\n", address, rom_offset, *ptr);
+            // Suppress logging for loop addresses (0x0380A588 to 0x0380A594)
+            if (address < 0x0380A588 || address > 0x0380A594) {
+                if (address != last_logged_address || log_counter % 1000 == 0) {
+                    printf("ROM alias read at 0x%08X (offset 0x%08X): 0x%08X\n", address, rom_offset, *ptr);
+                    last_logged_address = address;
+                }
+            }
+            log_counter++;
             return *ptr;
         } else {
             printf("ROM alias read beyond size at 0x%08X\n", address);
@@ -80,7 +90,14 @@ uint32_t memory_read_word(memory_t* mem, uint32_t address) {
     else if (address >= mem->rom_base && address < mem->rom_base + mem->rom_size - 3) {
         uint32_t offset = address - mem->rom_base;
         uint32_t* ptr = (uint32_t*)(mem->rom + offset);
-        printf("ROM read at 0x%08X (offset 0x%08X): 0x%08X\n", address, offset, *ptr);
+        // Suppress logging for loop addresses (0x0380A588 to 0x0380A594)
+        if (address < 0x0380A588 || address > 0x0380A594) {
+            if (address != last_logged_address || log_counter % 1000 == 0) {
+                printf("ROM read at 0x%08X (offset 0x%08X): 0x%08X\n", address, offset, *ptr);
+                last_logged_address = address;
+            }
+        }
+        log_counter++;
         return *ptr;
     }
     else if (address >= IO_BASE && address < IO_BASE + IO_SIZE - 3) {

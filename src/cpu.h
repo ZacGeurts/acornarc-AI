@@ -16,11 +16,13 @@
 #define MODE_IRQ 0x12
 #define MODE_SVC 0x13
 
-typedef struct {
-    uint32_t registers[16]; // R0-R15 (R15 is PC)
-    uint32_t cpsr; // Current Program Status Register
-    uint32_t spsr; // Saved Program Status Register
-    memory_t* memory;
+typedef struct arm3_cpu {
+    memory_t* mem;
+    uint32_t registers[16];
+    uint32_t cpsr;
+    uint32_t spsr;
+    uint32_t spsr_irq; // Added for IRQ mode
+    uint32_t spsr_fiq; // Added for FIQ mode
 } arm3_cpu_t;
 
 arm3_cpu_t* cpu_create(memory_t* mem);
