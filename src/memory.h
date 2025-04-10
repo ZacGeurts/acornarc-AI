@@ -7,8 +7,8 @@
 // Forward declaration of struct io (to avoid circular dependency with io.h)
 struct io;
 
-#define RAM_SIZE (2 * 1024 * 1024) // 2MB
-#define ROM_SIZE (2 * 1024 * 1024) // 2MB
+#define RAM_SIZE (static_cast<size_t>(16 * 1024 * 1024)) // 16MB
+#define ROM_SIZE (static_cast<size_t>(2 * 1024 * 1024))  // 2MB
 #define RAM_BASE 0x00000000
 #define ROM_DEFAULT_BASE 0x03800000
 #define IO_BASE 0x02000000
@@ -22,7 +22,7 @@ typedef struct memory {
     uint32_t rom_base;
     uint32_t floppy_offset;
     struct io* io;
-	int is_boot_mode; // 1 at boot, 0 after initialization
+    int is_boot_mode; // 1 at boot, 0 after initialization
 } memory_t;
 
 memory_t* memory_create(const char* jfd_path, uint32_t rom_base, struct io* io);

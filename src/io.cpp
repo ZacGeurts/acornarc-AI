@@ -97,9 +97,7 @@ uint32_t io_read_word(io_t* io, memory_t* mem, uint32_t address) {
     if (address >= VIDC_BASE && address < VIDC_BASE + VIDC_SIZE) {
         uint32_t offset = (address - VIDC_BASE) >> 2;
         switch (offset) {
-            case 0:
-                // Simulate VIDC status: reflect VFLY interrupt state
-                return io->vidc.control | (io->ioc.irq_request_a & (1 << 3) ? 0x8 : 0);
+            case 0: return io->vidc.control | (io->ioc.irq_request_a & (1 << 3) ? 0x8 : 0);
             case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
             case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16:
             case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 24:
@@ -163,7 +161,7 @@ uint32_t io_read_word(io_t* io, memory_t* mem, uint32_t address) {
             case 0: return io->ioc.control;
             case 1: return io->ioc.timer0_low;
             case 2: return io->ioc.timer0_high;
-            case 3: return io->ioc.timer1_low; // Fixed typo: was timer1_cklow
+            case 3: return io->ioc.timer1_low;
             case 4: return io->ioc.timer1_high;
             case 5: return io->ioc.timer0_latch;
             case 6: return io->ioc.timer1_latch;
@@ -176,41 +174,42 @@ uint32_t io_read_word(io_t* io, memory_t* mem, uint32_t address) {
             case 13: return io->ioc.fiq_status;
             case 14: return io->ioc.fiq_request;
             case 15: return io->ioc.fiq_mask;
-            case 16: return io->ioc.podule_irq_mask;
+            case 16: return io->ioc.fiq_status; // Reflect fiq_status for polling
             case 17: return io->ioc.podule_irq_request;
             default:
                 printf("IOC read at 0x%08X (offset 0x%08X) (unimplemented)\n", address, offset);
                 return 0;
         }
+    } else if (address == 0x0363D8BC) {
+        // Simulate IRQ status polling (e.g., VSYNC or timer)
+        static int read_count = 0;
+        read_count++;
+        if (read_count > 100) { // Delay to mimic hardware response
+            io->ioc.irq_request_a |= (1 << 1); // Bit 1: General IRQ (e.g., VSYNC)
+            io->irq_pending = true;
+            printf("Simulated IRQ ready at 0x%08X: 0x%08X (irq_request_a: 0x%08X)\n",
+                   address, io->ioc.irq_request_a & io->ioc.irq_mask_a, io->ioc.irq_request_a);
+            return io->ioc.irq_request_a & io->ioc.irq_mask_a; // Masked IRQ status
+        }
+        printf("Polling IRQ at 0x%08X: 0x%08X\n", address, io->ioc.irq_request_a & io->ioc.irq_mask_a);
+        return io->ioc.irq_request_a & io->ioc.irq_mask_a; // No IRQ yet
+    } else {
+        printf("I/O read at 0x%08X (unimplemented)\n", address);
+        return 0;
     }
-    printf("I/O read at 0x%08X (unimplemented)\n", address);
-    return 0;
 }
 
 void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
-    // MEMC control range (0x03600000 - 0x036000FF)
     if (address >= 0x03600000 && address < 0x03600100) {
         printf("MEMC write at 0x%08X with value 0x%08X\n", address, value);
-        mem->is_boot_mode = 0; // Switch to RAM mode
+        mem->is_boot_mode = 0;
         return;
     }
-
-    static uint32_t last_logged_address = 0xFFFFFFFF;
-    static uint32_t last_logged_value = 0xFFFFFFFF;
-    static int log_counter = 0;
 
     if (address >= VIDC_BASE && address < VIDC_BASE + VIDC_SIZE) {
         uint32_t offset = (address - VIDC_BASE) >> 2;
         switch (offset) {
-            case 0:
-                io->vidc.control = value;
-                if (address != last_logged_address || value != last_logged_value || log_counter % 1000 == 0) {
-                    printf("VIDC control write: 0x%08X at 0x%08X\n", value, address);
-                    last_logged_address = address;
-                    last_logged_value = value;
-                }
-                log_counter++;
-                break;
+            case 0: io->vidc.control = value; break;
             case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
             case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16:
             case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 24:
@@ -243,16 +242,11 @@ void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
             case 233: case 234: case 235: case 236: case 237: case 238: case 239: case 240:
             case 241: case 242: case 243: case 244: case 245: case 246: case 247: case 248:
             case 249: case 250: case 251: case 252: case 253: case 254: case 255:
-                io->vidc.palette[offset - 1] = value & 0x1FFF; // 13-bit RGB
-                printf("VIDC palette[%u] write: 0x%04X at 0x%08X\n", offset - 1, value & 0x1FFF, address);
+                io->vidc.palette[offset - 1] = value & 0x1FFF;
                 break;
-            case 256:
-                io->vidc.border_color = value & 0x1FFF;
-                printf("VIDC border_color write: 0x%04X at 0x%08X\n", value & 0x1FFF, address);
-                break;
+            case 256: io->vidc.border_color = value & 0x1FFF; break;
             case 257: case 258: case 259:
                 io->vidc.cursor_palette[offset - 257] = value & 0x1FFF;
-                printf("VIDC cursor_palette[%u] write: 0x%04X at 0x%08X\n", offset - 257, value & 0x1FFF, address);
                 break;
             case 260: io->vidc.h_cycle = value; break;
             case 261: io->vidc.h_sync_width = value; break;
@@ -280,19 +274,10 @@ void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
                 break;
             case 272: io->vidc.v_border_end = value; break;
             case 273: io->vidc.v_cursor_end = value; break;
-            case 274:
-                io->vidc.sound_freq = value & 0xFF; // 8-bit
-                printf("VIDC sound_freq write: %u at 0x%08X\n", value & 0xFF, address);
-                break;
+            case 274: io->vidc.sound_freq = value & 0xFF; break;
             case 275: io->vidc.sound_control = value; break;
-            case 276:
-                io->vidc.video_base = value & ADDR_MASK;
-                printf("VIDC video_base write: 0x%08X at 0x%08X\n", value, address);
-                break;
-            case 277:
-                io->vidc.ext_latch_c = value & 0xFF; // Clock and sync bits
-                printf("VIDC ext_latch_c write: 0x%02X at 0x%08X\n", value & 0xFF, address);
-                break;
+            case 276: io->vidc.video_base = value & ADDR_MASK; break;
+            case 277: io->vidc.ext_latch_c = value & 0xFF; break;
             default:
                 printf("VIDC write at 0x%08X (offset 0x%08X) with value 0x%08X (unimplemented)\n", address, offset, value);
                 break;
@@ -307,7 +292,7 @@ void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
             case 4: io->ioc.timer1_high = value & 0xFFFF; break;
             case 5:
                 io->ioc.timer0_latch = value & 0xFFFF;
-                io->ioc.timer0_low = value & 0xFFFF; // Reset on latch write
+                io->ioc.timer0_low = value & 0xFFFF;
                 break;
             case 6:
                 io->ioc.timer1_latch = value & 0xFFFF;
@@ -319,7 +304,10 @@ void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
             case 10: io->ioc.irq_status_b = value; break;
             case 11: io->ioc.irq_request_b = value; break;
             case 12: io->ioc.irq_mask_b = value; break;
-            case 13: io->ioc.fiq_status = value; break;
+            case 13:
+                io->ioc.fiq_status = value & 0xFF; // Store byte value for FIQ status
+                printf("IOC fiq_status write at 0x%08X: 0x%02X\n", address, value & 0xFF);
+                break;
             case 14: io->ioc.fiq_request = value; break;
             case 15: io->ioc.fiq_mask = value; break;
             case 16: io->ioc.podule_irq_mask = value; break;
@@ -329,7 +317,6 @@ void io_write_word(io_t* io, memory_t* mem, uint32_t address, uint32_t value) {
                 break;
         }
     } else if (address == 0x02FF5500) {
-        // Temporary workaround: treat as VIDC control write
         io->vidc.control = value;
         printf("Mapped write to VIDC control at 0x%08X with value 0x%08X\n", address, value);
     } else {

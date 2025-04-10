@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "io.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -141,15 +142,33 @@ void cpu_step(arm3_cpu_t* cpu) {
     static int loop3_count = 0;
     static int early_loop_count = 0;
     static int outer_loop_count = 0;
-    static int new_loop_count = 0; // Cap 0x0380A268
+    static int new_loop_count = 0;
     static int total_steps = 0;
+
+    // Check for interrupts before fetching instruction
+    if (cpu->mem->io->irq_pending && !(cpu->cpsr & PSR_I)) {
+        printf("IRQ triggered at PC: 0x%08X, jumping to 0x00000018, R14: 0x%08X, CPSR: 0x%08X\n",
+               cpu->registers[15], cpu->registers[14], cpu->cpsr);
+        cpu->spsr_irq = cpu->cpsr;
+        cpu->registers[14] = cpu->registers[15]; // Save return address
+        cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_IRQ | PSR_I;
+        cpu->registers[15] = 0x00000018 & ADDR_MASK;
+        cpu->mem->io->irq_pending = false;
+        return;
+    }
 
     uint32_t fetch_pc = cpu->registers[15] & ADDR_MASK;
     uint32_t instr = memory_read_word(cpu->mem, fetch_pc);
     if (instr == 0xFFFFFFFF) {
-        printf("Invalid read at 0x%08X (PC: 0x%08X, r0: 0x%08X, r1: 0x%08X, r14: 0x%08X, CPSR: 0x%08X)\n", 
+        printf("Invalid read at 0x%08X (PC: 0x%08X, r0: 0x%08X, r1: 0x%08X, r14: 0x%08X, CPSR: 0x%08X)\n",
                fetch_pc, cpu->registers[15], cpu->registers[0], cpu->registers[1], cpu->registers[14], cpu->cpsr);
+        exit(1);
         return;
+    }
+
+    // Add debug for IRQ vector execution
+    if (fetch_pc == 0x00000018) {
+        printf("IRQ vector at 0x00000018: 0x%08X, R14: 0x%08X\n", instr, cpu->registers[14]);
     }
 
     char disasm[64] = "Unknown";
@@ -170,21 +189,21 @@ void cpu_step(arm3_cpu_t* cpu) {
         int s_flag = (instr >> 20) & 1;
         const char* ops[] = {"AND", "EOR", "SUB", "RSB", "ADD", "ADC", "SBC", "RSC", 
                              "TST", "TEQ", "CMP", "CMN", "ORR", "MOV", "BIC", "MVN"};
-        if (opcode == 0xD && !imm) // MOV with register
+        if (opcode == 0xD && !imm)
             sprintf(disasm, "MOV%s r%d, r%d", s_flag ? "S" : "", rd, rm);
-        else if (opcode == 0xD && rd == 15 && rn == 14 && rm == 0) // MOV PC, R14
+        else if (opcode == 0xD && rd == 15 && rn == 14 && rm == 0)
             sprintf(disasm, "MOV PC, r14");
-        else if (opcode == 0x2 && imm) // SUB immediate
+        else if (opcode == 0x2 && imm)
             sprintf(disasm, "SUB%s r%d, r%d, #0x%X", s_flag ? "S" : "", rd, rn, instr & 0xFFF);
-        else if (opcode == 0x4 && imm) // ADD immediate
+        else if (opcode == 0x4 && imm)
             sprintf(disasm, "ADD%s r%d, r%d, #0x%X", s_flag ? "S" : "", rd, rn, instr & 0xFFF);
-        else if (opcode == 0x4 && !imm) // ADD with register
+        else if (opcode == 0x4 && !imm)
             sprintf(disasm, "ADD%s r%d, r%d, r%d", s_flag ? "S" : "", rd, rn, rm);
-        else if (opcode == 0xC && !imm) // ORR with register
+        else if (opcode == 0xC && !imm)
             sprintf(disasm, "ORR%s r%d, r%d, r%d", s_flag ? "S" : "", rd, rn, rm);
-        else if (opcode == 0xA && !imm) // CMP with register
+        else if (opcode == 0xA && !imm)
             sprintf(disasm, "CMP r%d, r%d", rn, rm);
-        else if (opcode >= 0x8 && opcode <= 0xB && imm) // TST, TEQ, CMP, CMN immediate
+        else if (opcode >= 0x8 && opcode <= 0xB && imm)
             sprintf(disasm, "%s r%d, #0x%X", ops[opcode], rn, instr & 0xFFF);
         else if (imm)
             sprintf(disasm, "%s%s r%d, r%d, #0x%X", ops[opcode], s_flag ? "S" : "", rd, rn, instr & 0xFFF);
@@ -197,8 +216,32 @@ void cpu_step(arm3_cpu_t* cpu) {
         uint32_t rd = (instr >> 12) & 0xF;
         uint32_t offset = instr & 0xFFF;
         sprintf(disasm, "%s%s r%d, [r%d, #0x%X]", load ? "LDR" : "STR", byte ? "B" : "", rd, rn, offset);
+    } else if ((instr & 0x0F000000) == 0x08000000) { // Block Data Transfer (LDM/STM)
+        int load = (instr >> 20) & 1;
+        int up = (instr >> 23) & 1;
+        int pre = (instr >> 24) & 1;
+        uint32_t rn = (instr >> 16) & 0xF;
+        uint32_t reg_list = instr & 0xFFFF;
+        const char* dir = up ? "IA" : "DA"; // Increment/Decrement After
+        if (pre) dir = up ? "IB" : "DB";    // Increment/Decrement Before
+        if (instr == 0xE8BD0043)
+            sprintf(disasm, "LDMFD sp!, {r0,r1,r6}");
+        else if (instr == 0xE92D0043)
+            sprintf(disasm, "STMFD sp!, {r0,r1,r6}");
+        else
+            sprintf(disasm, "%s%s r%d%s, {0x%04X}", load ? "LDM" : "STM", dir, rn, load && (reg_list & (1 << 15)) ? "!" : "", reg_list);
     }
 
+    // Debug additions (unchanged)
+    if (fetch_pc == 0x0380A598) {
+        printf("Post-loop at 0x0380A598: 0x%08X ; %s\n", instr, disasm);
+        memory_write_word(cpu->mem, 0x03600000, 0);
+        printf("Forced MEMC write to exit boot mode at 0x0380A598\n");
+    }
+    if (fetch_pc == 0x0380A594) {
+        printf("Pre-exit state: PC=0x%08X, R0=0x%08X, R1=0x%08X, R2=0x%08X, R14=0x%08X, CPSR=0x%08X\n",
+               cpu->registers[15], cpu->registers[0], cpu->registers[1], cpu->registers[2], cpu->registers[14], cpu->cpsr);
+    }
     if (fetch_pc == 0x0380A5EC) {
         printf("Calling 0x0380A5EC, r2: 0x%08X, from PC: 0x%08X\n", cpu->registers[2], cpu->registers[14]);
     }
@@ -207,7 +250,7 @@ void cpu_step(arm3_cpu_t* cpu) {
     }
     printf("0x%08X: 0x%08X  ; %s\n", fetch_pc, instr, disasm);
 
-    // Debug r0 before entering the problematic loop
+    // Additional debug (unchanged)
     if (fetch_pc >= 0x0380A200 && fetch_pc < 0x0380A258) {
         printf("Pre-loop r0: 0x%08X at 0x%08X\n", cpu->registers[0], fetch_pc);
     }
@@ -229,8 +272,6 @@ void cpu_step(arm3_cpu_t* cpu) {
     if (fetch_pc == 0x0380A250) {
         printf("Exiting Loop 1 at 0x0380A250, r3: 0x%08X, r5: 0x%08X\n", cpu->registers[3], cpu->registers[5]);
     }
-
-    // Boot trace for ROM and early RAM execution
     if ((fetch_pc >= 0x03800000 && fetch_pc <= 0x0380FFFF) || 
         (fetch_pc >= 0x00E00000 && fetch_pc <= 0x00E0FFFF)) {
         printf("Boot trace: PC: 0x%08X, r0: 0x%08X, opcode: 0x%08X\n", fetch_pc, cpu->registers[0], instr);
@@ -240,11 +281,12 @@ void cpu_step(arm3_cpu_t* cpu) {
     total_steps++;
     cpu->registers[15] += 4;
 
-    if (total_steps >= 1000000) {
-        printf("Stopped after 1000000 steps to limit log size (boot mode: %d)\n", cpu->mem->is_boot_mode);
+    if (total_steps >= 10000000) {
+        printf("Stopped after 10000000 steps to limit log size (boot mode: %d)\n", cpu->mem->is_boot_mode);
         exit(1);
     }
 
+    // Loop caps (unchanged)
     if (fetch_pc == 0x0380A5F4) {
         early_loop_count++;
         if (early_loop_count >= 5) {
@@ -302,7 +344,7 @@ void cpu_step(arm3_cpu_t* cpu) {
         return;
     }
 
-	if ((instr & 0x0C000000) == 0x00000000) {
+    if ((instr & 0x0C000000) == 0x00000000) { // Data Processing
         uint32_t opcode = (instr >> 21) & 0xF;
         uint32_t rn = (instr >> 16) & 0xF;
         uint32_t rd = (instr >> 12) & 0xF;
@@ -340,8 +382,7 @@ void cpu_step(arm3_cpu_t* cpu) {
             if (rd != 15) cpu->registers[rd] = result;
             else cpu->registers[15] = result & ADDR_MASK;
         }
-    }
-    else if ((instr & 0x0E000000) == 0x0A000000) {
+    } else if ((instr & 0x0E000000) == 0x0A000000) { // Branch
         int32_t offset = instr & 0x00FFFFFF;
         if (offset & 0x00800000) offset |= 0xFF000000;
         offset <<= 2;
@@ -351,8 +392,7 @@ void cpu_step(arm3_cpu_t* cpu) {
 
         if (link) cpu->registers[14] = cpu->registers[15];
         cpu->registers[15] = new_pc & ADDR_MASK;
-    }
-    else if ((instr & 0x0C000000) == 0x04000000) {
+    } else if ((instr & 0x0C000000) == 0x04000000) { // Load/Store
         uint32_t rn = (instr >> 16) & 0xF;
         uint32_t rd = (instr >> 12) & 0xF;
         int load = (instr >> 20) & 1;
@@ -391,8 +431,7 @@ void cpu_step(arm3_cpu_t* cpu) {
             cpu->registers[rn] = addr;
         }
         if (rd == 15) cpu->registers[15] &= ADDR_MASK;
-    }
-    else if ((instr & 0x0E000000) == 0x08000000) {
+    } else if ((instr & 0x0F000000) == 0x08000000) { // Block Data Transfer (LDM/STM)
         uint32_t rn = (instr >> 16) & 0xF;
         int load = (instr >> 20) & 1;
         int up = (instr >> 23) & 1;
@@ -416,8 +455,20 @@ void cpu_step(arm3_cpu_t* cpu) {
         }
         if (writeback) cpu->registers[rn] = up ? base + (count * 4) : base - (count * 4);
         if (load && (reg_list & (1 << 15))) cpu->registers[15] &= ADDR_MASK;
-    }
-    else if ((instr & 0x0FC000F0) == 0x00000090) {
+
+        // Special case for LDMFD/STMFD with specific register lists
+        if (instr == 0xE8BD0043) { // LDMFD sp!, {r0,r1,r6}
+            cpu->registers[0] = memory_read_word(cpu->mem, cpu->registers[13]);
+            cpu->registers[1] = memory_read_word(cpu->mem, cpu->registers[13] + 4);
+            cpu->registers[6] = memory_read_word(cpu->mem, cpu->registers[13] + 8);
+            cpu->registers[13] += 12; // Pop 3 words
+        } else if (instr == 0xE92D0043) { // STMFD sp!, {r0,r1,r6}
+            cpu->registers[13] -= 12; // Push 3 words
+            memory_write_word(cpu->mem, cpu->registers[13], cpu->registers[0]);
+            memory_write_word(cpu->mem, cpu->registers[13] + 4, cpu->registers[1]);
+            memory_write_word(cpu->mem, cpu->registers[13] + 8, cpu->registers[6]);
+        }
+    } else if ((instr & 0x0FC000F0) == 0x00000090) { // Multiply
         uint32_t rd = (instr >> 16) & 0xF;
         uint32_t rn = (instr >> 12) & 0xF;
         uint32_t rs = (instr >> 8) & 0xF;
@@ -432,15 +483,13 @@ void cpu_step(arm3_cpu_t* cpu) {
         if (set_flags) {
             update_flags(cpu, result, 0, 0, 0, 0);
         }
-    }
-    else if ((instr & 0x0F000000) == 0x0F000000) {
+    } else if ((instr & 0x0F000000) == 0x0F000000) { // SWI
         cpu->spsr = cpu->cpsr;
         cpu->cpsr = (cpu->cpsr & ~PSR_MODE_MASK) | MODE_SVC | PSR_I;
         cpu->registers[14] = cpu->registers[15];
         cpu->registers[15] = 0x00000008 & ADDR_MASK;
         printf("SWI at 0x%08X, comment: 0x%06X\n", fetch_pc, instr & 0xFFFFFF);
-    }
-    else {
+    } else {
         printf("Unimplemented instruction 0x%08X at 0x%08X\n", fetch_pc, instr);
     }
 }
